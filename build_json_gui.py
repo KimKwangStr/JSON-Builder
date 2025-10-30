@@ -334,15 +334,15 @@ class App(tk.Tk):
         self.grid_columnconfigure(1, weight=1)
         tk.Button(self, text='Build JSON', command=self.on_build).grid(row=10, column=2, sticky='e', padx=8, pady=10)
 
-    def logmsg(self, msg: str):
-        # Safer logging that avoids unterminated string issues
-        try:
-            self.log.insert('end', f"{msg}
-")
-            self.log.see('end')
-            self.update_idletasks()
-        except Exception:
-            pass
+def logmsg(self, msg: str):
+    # Robust logger: avoid embedded newline escapes in a single literal
+    try:
+        self.log.insert('end', str(msg))
+        self.log.insert('end', '\n')
+        self.log.see('end')
+        self.update_idletasks()
+    except Exception:
+        pass
 
     def on_build(self):
         try:
