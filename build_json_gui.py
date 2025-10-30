@@ -40,6 +40,12 @@ def deep_clone(obj: Any) -> Any:
 # Template introspection
 # -----------------------------
 class TemplateForms:
+    """
+    Learns prototypes from template.json. Your template places:
+      SP&D under Extraction.child_forms,
+      Safety and Performance (discrete) under SP&D.child_forms,
+      Harms under Safety.child_forms.
+    """
     def __init__(self, template_obj: Any):
         if isinstance(template_obj, list): root = template_obj[0]
         elif isinstance(template_obj, dict): root = template_obj
@@ -57,7 +63,7 @@ class TemplateForms:
         self.harms_proto = None
         self.followup_proto = None
 
-        # 1) Look at Extraction → child_forms
+        # 1) Extraction → child_forms (some templates may place forms here)
         for _, v in (self.extraction_proto.get("child_forms", {}) or {}).items():
             name = (v.get("form") or "").strip()
             if name == "Study Parameters and Demographics":
@@ -69,7 +75,7 @@ class TemplateForms:
             elif name == "Follow-up Subform":
                 self.followup_proto = deep_clone(v)
 
-        # 2) If needed, also look under SP&D → child_forms for Safety, Performance (discrete), Follow-up
+        # 2) SP&D → child_forms (this is where your template places Safety & Performance & Follow-up)
         if self.spd_proto:
             for _, v in (self.spd_proto.get("child_forms", {}) or {}).items():
                 nm = (v.get("form") or "").strip()
@@ -80,7 +86,7 @@ class TemplateForms:
                 if nm == "Performance (discrete)" and self.perf_discrete_proto is None:
                     self.perf_discrete_proto = deep_clone(v)
 
-        # 3) Harms discovery under Safety → child_forms
+        # 3) Safety → child_forms → Harms
         if self.safety_proto:
             for _, v in (self.safety_proto.get("child_forms", {}) or {}).items():
                 if (v.get("form") or "").strip() == "Harms":
@@ -128,21 +134,27 @@ class JSONBuilder:
                 if q_text == "Associated CERs":
                     items = [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
                     if not items:
-                        form["data"].append({"question": q_text, "type": q_type, "response": {"text": "", "answer": ""}})
+                        form["data"].append({"question": q_text, "type": q_type,
+                                             "response": {"text": "", "answer": ""}})
                     else:
                         for item in items:
-                            form["data"].append({"question": q_text, "type": q_type, "response": {"text": "", "answer": item}})
+                            form["data"].append({"question": q_text, "type": q_type,
+                                                 "response": {"text": "", "answer": item}})
                 else:
                     resp = {"answer":"", "text":""}
-                    if q_type in ("Radio","Checkbox"): resp["answer"] = val
-                    else: resp["text"] = val
+                    if q_type in ("Radio","Checkbox"):
+                        resp["answer"] = val
+                    else:
+                        resp["text"] = val
                     form["data"].append({"question": q_text, "type": q_type, "response": resp})
             else:
-                form["data"].append({"question": q_text, "type": q_type, "response": {"answer": "", "text": ""}})
+                form["data"].append({"question": q_text, "type": q_type,
+                                     "response": {"answer": "", "text": ""}})
         if "child_forms" not in form: form["child_forms"] = {}
         return form
 
-    def _generic_form_from_row(self, form_name: str, row: Dict[str, str], *, is_subform: int, level: int = 1) -> Dict[str, Any]:
+    def _generic_form_from_row(self, form_name: str, row: Dict[str, str], *,
+                               is_subform: int, level: int = 1) -> Dict[str, Any]:
         """Fallback when a prototype is not found: map CSV columns to Text questions, keep schema."""
         frm = {
             "form": form_name,
@@ -215,7 +227,6 @@ class JSONBuilder:
                 spd_id = (spd_row.get("spd_id") or "").strip()
                 if not spd_id:
                     continue
-
                 # --- SP&D (prototype required) ---
                 if self.t.spd_proto is None:
                     raise ValueError("Template missing Study Parameters and Demographics prototype.")
@@ -228,38 +239,37 @@ class JSONBuilder:
                 # Place SP&D under extraction.child_forms with "spd_XX" key
                 extraction["child_forms"][f"spd_{spd_id}"] = spd_form
 
-                # --- Performance (discrete) forms ---
+                # --- Performance (discrete) forms under SP&D ---
                 for perf_row in perf_by_key.get((refid, spd_id), []):
                     if self.t.perf_discrete_proto is not None:
                         perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, perf_row)
-                        perf_form["key"] = f"perf_{self._gen_id()}"
+                        perf_form["key"]  = f"perf_{self._gen_id()}"
                         perf_form["form"] = "Performance (discrete)"
                         perf_form["user"] = USER_NAME
                     else:
-                        # fallback generic perf form
                         perf_form = self._generic_form_from_row("Performance (discrete)", perf_row, is_subform=0, level=1)
                     spd_form["child_forms"][self._gen_id()] = perf_form
 
-                # --- Safety (+ Harms) forms ---
+                # --- Safety (+ Harms) forms under SP&D ---
                 for srow in safety_by_key.get((refid, spd_id), []):
+                    safety_id = (srow.get("safety_id") or "").strip()
+
                     if self.t.safety_proto is not None:
                         safety_form = self._populate_form_from_row(self.t.safety_proto, srow)
                         safety_form["form"] = "Safety"
                         safety_form["user"] = USER_NAME
-                        safety_id = (srow.get("safety_id") or "").strip()
-                        safety_form["key"] = f"safety_{safety_id or self._gen_id()}"
+                        safety_form["key"]  = f"safety_{safety_id or self._gen_id()}"
                         safety_form["child_forms"] = {}
                     else:
                         safety_form = self._generic_form_from_row("Safety", srow, is_subform=0, level=1)
-                        safety_id = (srow.get("safety_id") or "").strip()
 
-                    # Harms under Safety
+                    # Harms under Safety (linked by safety_id)
                     for hrow in harms_by_safety_id.get(safety_id, []):
                         if self.t.harms_proto is not None:
                             harms_form = self._populate_form_from_row(self.t.harms_proto, hrow)
                             harms_form["form"] = "Harms"
                             harms_form["user"] = USER_NAME
-                            harms_form["key"] = f"harms_{self._gen_id()}"
+                            harms_form["key"]  = f"harms_{self._gen_id()}"
                         else:
                             harms_form = self._generic_form_from_row("Harms", hrow, is_subform=1, level=1)
                         safety_form["child_forms"][self._gen_id()] = harms_form
@@ -329,7 +339,6 @@ class App(tk.Tk):
         tk.Button(self, text="Build JSON", command=self.on_build).grid(row=10, column=2, sticky="e", padx=8, pady=10)
 
     def logmsg(self, msg: str):
-        # Robust logger: no embedded newline escapes in a single literal
         try:
             self.log.insert("end", str(msg))
             self.log.insert("end", "\n")
@@ -361,6 +370,14 @@ class App(tk.Tk):
             self.logmsg("Loading template...")
             template_obj = read_json(self.template_path.get())
             tf = TemplateForms(template_obj)
+
+            # Log what we found so it's easy to verify against the template
+            self.logmsg(f"Prototypes found: SP&D={tf.spd_proto is not None}, "
+                        f"Safety={tf.safety_proto is not None}, "
+                        f"Perf={tf.perf_discrete_proto is not None}, "
+                        f"Harms={tf.harms_proto is not None}, "
+                        f"Followup={tf.followup_proto is not None}")
+
             builder = JSONBuilder(tf)
 
             self.logmsg("Reading CSVs...")
@@ -369,6 +386,10 @@ class App(tk.Tk):
             perf_rows = read_csv(self.perf_path.get())
             harms_rows = read_csv(self.harms_path.get())
             followup_rows = read_csv(self.followup_path.get()) if self.followup_path.get() else []
+
+            self.logmsg(f"SPD rows: {len(spd_rows)} | Safety rows: {len(safety_rows)} | "
+                        f"Perf rows: {len(perf_rows)} | Harms rows: {len(harms_rows)} | "
+                        f"Follow-up rows: {len(followup_rows)}")
 
             # Basic validation of required ID columns
             def require(cols, rows, name):
@@ -387,7 +408,6 @@ class App(tk.Tk):
             self.logmsg("Writing output...")
             write_json(self.out_path.get(), out_list)
 
-            # Success message without embedded newline in f-string
             out_path = str(self.out_path.get())
             msg = "JSON built successfully and saved to:" + "\n" + out_path
             messagebox.showinfo("Success", msg)
