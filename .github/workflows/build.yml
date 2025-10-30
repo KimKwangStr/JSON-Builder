@@ -32,11 +32,18 @@ jobs:
           python -m pip install --upgrade pyinstaller
           python -m PyInstaller --version
 
-      - name: Write clean build_json_gui.py (from here-string)
+      # Write a clean, known-good copy of build_json_gui.py on the runner
+      - name: Write build_json_gui.py
         shell: pwsh
         run: |
           @'
 # build_json_gui.py
+# JSON builder GUI that preserves a DistillerSR-like template schema.
+# - Places SP&D under Extraction.child_forms keyed as "spd_XX"
+# - Safety under SP&D; Harms under Safety linked by safety_id
+# - Performance (discrete) under SP&D
+# - Follow-up Subform from template prototype when present
+# - Sets user = "KimKwang" everywhere
 import json, csv, copy, tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Tuple
@@ -142,96 +149,4 @@ class JSONBuilder:
                     else: resp["text"] = val
                     form["data"].append({"question": q_text, "type": q_type, "response": resp})
             else:
-                form["data"].append({"question": q_text, "type": q_type, "response": {"answer": "", "text": ""}})
-        if "child_forms" not in form: form["child_forms"] = {}
-        return form
-
-    def build(self,
-              template_root: Dict[str, Any],
-              spd_rows: List[Dict[str, str]],
-              safety_rows: List[Dict[str, str]],
-              perf_rows: List[Dict[str, str]],
-              harms_rows: List[Dict[str, str]],
-              followup_rows: List[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-        followup_rows = followup_rows or []
-
-        spd_by_refid: Dict[str, List[Dict[str, str]]] = {}
-        for r in spd_rows:
-            rf = (r.get("refid") or "").strip()
-            if rf: spd_by_refid.setdefault(rf, []).append(r)
-
-        safety_by_key: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
-        for r in safety_rows:
-            rf = (r.get("refid") or "").strip()
-            spd = (r.get("spd_id") or "").strip()
-            safety_by_key.setdefault((rf, spd), []).append(r)
-
-        harms_by_safety_id: Dict[str, List[Dict[str, str]]] = {}
-        for r in harms_rows:
-            sid = (r.get("safety_id") or "").strip()
-            if sid: harms_by_safety_id.setdefault(sid, []).append(r)
-
-        perf_by_key: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
-        for r in perf_rows:
-            rf = (r.get("refid") or "").strip()
-            spd = (r.get("spd_id") or "").strip()
-            perf_by_key.setdefault((rf, spd), []).append(r)
-
-        followup_by_key: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
-        for r in followup_rows:
-            rf = (r.get("refid") or "").strip()
-            spd = (r.get("spd_id") or "").strip()
-            followup_by_key.setdefault((rf, spd), []).append(r)
-
-        out: List[Dict[str, Any]] = []
-        for refid, spd_list in spd_by_refid.items():
-            root = {"refid": int(refid) if refid.isdigit() else refid,
-                    "tags": [], "attachments": [], "biblio_string": "", "data_sets": {}}
-            ds_id = self._gen_id()
-            extraction = self._make_extraction(refid)
-            extraction["child_forms"] = {}
-
-            for spd_row in spd_list:
-                spd_id = (spd_row.get("spd_id") or "").strip()
-                if not spd_id: continue
-                if self.t.spd_proto is None:
-                    raise ValueError("Template missing SP&D prototype.")
-                spd_form = self._populate_form_from_row(self.t.spd_proto, spd_row)
-                spd_form["key"] = f"spd_{spd_id}"
-                spd_form["form"] = "Study Parameters and Demographics"
-                spd_form["user"] = USER_NAME
-                spd_form["child_forms"] = {}
-
-                extraction["child_forms"][f"spd_{spd_id}"] = spd_form
-
-                for perf_row in perf_by_key.get((refid, spd_id), []):
-                    if self.t.perf_discrete_proto is None: continue
-                    perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, perf_row)
-                    perf_form["key"] = f"perf_{self._gen_id()}"
-                    perf_form["form"] = "Performance (discrete)"
-                    perf_form["user"] = USER_NAME
-                    spd_form["child_forms"][self._gen_id()] = perf_form
-
-                for srow in safety_by_key.get((refid, spd_id), []):
-                    if self.t.safety_proto is None: continue
-                    safety_form = self._populate_form_from_row(self.t.safety_proto, srow)
-                    safety_id = (srow.get("safety_id") or "").strip()
-                    safety_form["key"] = f"safety_{safety_id or self._gen_id()}"
-                    safety_form["form"] = "Safety"
-                    safety_form["user"] = USER_NAME
-                    safety_form["child_forms"] = {}
-                    for hrow in harms_by_safety_id.get(safety_id, []):
-                        if self.t.harms_proto is None: continue
-                        harms_form = self._populate_form_from_row(self.t.harms_proto, hrow)
-                        harms_form["key"] = f"harms_{self._gen_id()}"
-                        harms_form["form"] = "Harms"
-                        harms_form["user"] = USER_NAME
-                        safety_form["child_forms"][self._gen_id()] = harms_form
-                    spd_form["child_forms"][self._gen_id()] = safety_form
-
-                for fu_row in followup_by_key.get((refid, spd_id), []):
-                    if self.t.followup_proto is not None:
-                        fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
-                        fu_form["form"] = "Follow-up Subform"
-                        fu_form["key"] = fu_form.get("key", f"followup_{self._gen_id()}")
-                       
+                form
