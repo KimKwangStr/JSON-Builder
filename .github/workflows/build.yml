@@ -1,7 +1,7 @@
 name: Build Windows EXE
 
 on:
-  workflow_dispatch:   # run manually
+  workflow_dispatch:
   push:
     paths:
       - 'build_json_gui.py'
@@ -15,19 +15,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify repository root contents
+      - name: Verify repository root contents (PowerShell)
         run: |
-          echo "Listing repository root..."
-          dir
-          if not exist build_json_gui.py (
-            echo [ERROR] build_json_gui.py not found at repo root. >&2
-            exit /b 1
-          )
+          Write-Host "Listing repository root..."
+          Get-ChildItem -Force
+          if (!(Test-Path -Path "build_json_gui.py")) {
+            Write-Error "[ERROR] build_json_gui.py not found at repo root."
+            exit 1
+          }
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'   # <- Pin to 3.11 for PyInstaller compatibility
+          python-version: '3.11'
 
       - name: Show Python & pip versions
         run: |
@@ -41,21 +41,19 @@ jobs:
           python -m PyInstaller --version
 
       - name: Build EXE (windowed, onefile)
-        shell: cmd
         run: |
-          echo Building EXE...
+          Write-Host "Building EXE..."
           python -m PyInstaller --clean --noconfirm --onefile --windowed build_json_gui.py
-          echo Listing dist folder...
-          if exist dist (
-            dir dist
-          ) else (
-            echo [ERROR] dist folder not found. Build likely failed. >&2
-            exit /b 1
-          )
-          if not exist dist\build_json_gui.exe (
-            echo [ERROR] build_json_gui.exe not found in dist. >&2
-            exit /b 1
-          )
+          Write-Host "Listing dist folder..."
+          if (!(Test-Path -Path "dist")) {
+            Write-Error "[ERROR] dist folder not found. Build likely failed."
+            exit 1
+          }
+          Get-ChildItem dist -Force
+          if (!(Test-Path -Path "dist/build_json_gui.exe")) {
+            Write-Error "[ERROR] build_json_gui.exe not found in dist."
+            exit 1
+          }
 
       - name: Upload executable
         uses: actions/upload-artifact@v4
@@ -64,7 +62,6 @@ jobs:
           path: dist/build_json_gui.exe
           if-no-files-found: error
 
-      # If anything fails above, capture logs for quick diagnosis
       - name: Upload build logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
