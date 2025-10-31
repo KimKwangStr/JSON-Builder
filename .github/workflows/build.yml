@@ -1,0 +1,519 @@
+name: Build Windows EXE (Heredoc)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Show Python & pip
+        shell: bash
+        run: |
+          python --version
+          python -m pip --version
+      - name: Install PyInstaller
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade pyinstaller
+          python -m PyInstaller --version
+      # Write a clean, known-good copy of build_json_gui.py using Bash heredoc
+      - name: Write build_json_gui.py
+        shell: bash
+        run: |
+          cat > build_json_gui.py << 'PYCODE'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_json_gui.py (stdlib-only)
+
+Template-driven JSON builder (GUI + CLI) that:
+- Creates one top-level record per unique `refid` from "Study and Patient Demographics.csv".
+- Under each top-level Extraction, creates one SPD form per `spd_id`, named "spd_XX".
+- Under each SPD, adds Safety and Performance (discrete) forms from their CSVs.
+- Under each Safety, nests Harms subforms matched by `safety_id`.
+- Optionally adds Follow-up subforms if template contains one and CSV is provided.
+
+No third-party dependencies (uses csv/json/tkinter).
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import json
+import os
+import re
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+# ------------------------------ Utility: string normalization -------------------------------- #
+
+def _normalize(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    s = re.sub(r"[^\w%()/?\-\s\.]", "", s)
+    s = s.replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# --------------------------------------- File I/O helpers ------------------------------------ #
+
+def read_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def write_json(path: str, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def read_csv_rows(path: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append({(k or "").strip(): (v or "").strip() for k, v in r.items()})
+    return rows
+
+# ------------------------------------- Template discovery ------------------------------------ #
+
+def _collect_all_numeric_keys(obj: Any, acc: Optional[List[int]] = None) -> List[int]:
+    if acc is None:
+        acc = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and k.isdigit():
+                acc.append(int(k))
+            _collect_all_numeric_keys(v, acc)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_all_numeric_keys(item, acc)
+    return acc
+def _find_form_id_by_terms(forms_dict: Dict[str, Any], terms: Tuple[str, ...]) -> Optional[str]:
+    for fid, node in (forms_dict or {}).items():
+        name = str(node.get("form", ""))
+        if all(t in _normalize(name) for t in terms):
+            return fid
+    return None
+def _deepcopy(x: Any) -> Any:
+    return copy.deepcopy(x)
+
+def _set_response(datum: Dict[str, Any], value: Any) -> None:
+    dtype = str(datum.get("type", "")).strip().lower()
+    resp = datum.get("response")
+    if not isinstance(resp, dict):
+        resp = {}
+        datum["response"] = resp
+    if dtype == "text":
+        resp["text"] = "" if value is None else str(value)
+        resp.setdefault("answer", "")
+    elif dtype in ("radio", "checkbox"):
+        resp["answer"] = "" if value is None else str(value)
+        resp.setdefault("text", "")
+    else:
+        resp["text"] = "" if value is None else str(value)
+        resp["answer"] = "" if value is None else str(value)
+
+def _header_index(headers: List[str]) -> Dict[str, str]:
+    return {_normalize(h): h for h in headers}
+
+def _populate_form_from_row(form_node: Dict[str, Any],
+                            row: Dict[str, str],
+                            hdr_idx: Dict[str, str],
+                            spd_label_override: Optional[str] = None) -> None:
+    for datum in form_node.get("data", []) or []:
+        q_text = str(datum.get("question", ""))
+        norm_q = _normalize(q_text)
+        value = None
+        if spd_label_override and norm_q in {_normalize("Dataset Label"), _normalize("Form Name")}:
+            value = spd_label_override
+        else:
+            if norm_q in hdr_idx:
+                col = hdr_idx[norm_q]
+                value = row.get(col, "")
+        _set_response(datum, value)
+
+class IdFactory:
+    def __init__(self, start_from: int) -> None:
+        self.n = start_from
+    def next(self) -> str:
+        self.n += 1
+        return str(self.n)
+
+# ------------------------------------------- Builder ----------------------------------------- #
+
+def build_from_files(template_path: str,
+                     spd_csv: str,
+                     safety_csv: Optional[str],
+                     perf_csv: Optional[str],
+                     harms_csv: Optional[str],
+                     follow_csv: Optional[str],
+                     zero_pad_spd: bool = False,
+                     log: Optional[callable] = None) -> List[Dict[str, Any]]:
+
+    def logp(msg: str) -> None:
+        if log:
+            log(msg)
+
+    template = read_json(template_path)
+    if not isinstance(template, list) or not template:
+        raise ValueError("Template must be a JSON array with at least one record.")
+    master = template[0]
+    ds_dict = master.get("data_sets", {}) or {}
+    if not ds_dict:
+        raise ValueError("Template missing 'data_sets'.")
+
+    # Find the extraction dataset by name terms
+    extraction_id = _find_form_id_by_terms(ds_dict, ("extraction",))
+    if extraction_id is None:
+        raise ValueError("Could not find top-level 'Extraction' dataset in template.")
+    extraction_proto = ds_dict[extraction_id]
+    extraction_children = extraction_proto.get("child_forms", {}) or {}
+
+    # SPD under Extraction
+    spd_id = _find_form_id_by_terms(extraction_children, ("study", "demographics"))
+    if spd_id is None:
+        raise ValueError("Could not find 'Study ... Demographics' form under Extraction.")
+    spd_proto = extraction_children[spd_id]
+    spd_children = spd_proto.get("child_forms", {}) or {}
+
+    # Safety, Perf (discrete), optional Follow-up
+    safety_id_under_spd = _find_form_id_by_terms(spd_children, ("safety",))
+    perf_id_under_spd = _find_form_id_by_terms(spd_children, ("performance", "discrete"))
+    follow_id_under_spd = _find_form_id_by_terms(spd_children, ("follow",))  # optional
+
+    harms_id_under_safety = None
+    safety_proto = spd_children.get(safety_id_under_spd, {}) if safety_id_under_spd else {}
+    safety_children = safety_proto.get("child_forms", {}) or {}
+    if safety_children:
+        harms_id_under_safety = _find_form_id_by_terms(safety_children, ("harms",))
+
+    # Start ID factory from max id present
+    start_from = max(_collect_all_numeric_keys(master) or [10000])
+    ids = IdFactory(start_from)
+
+    # Load CSV rows
+    spd_rows = read_csv_rows(spd_csv)
+    if not spd_rows:
+        raise ValueError("Study and Patient Demographics CSV has no rows.")
+
+    safety_rows = read_csv_rows(safety_csv) if safety_csv and os.path.exists(safety_csv) else []
+    perf_rows   = read_csv_rows(perf_csv)   if perf_csv and os.path.exists(perf_csv)   else []
+    harms_rows  = read_csv_rows(harms_csv)  if harms_csv and os.path.exists(harms_csv) else []
+    follow_rows = read_csv_rows(follow_csv) if follow_csv and os.path.exists(follow_csv) else []
+
+    # Build quick header maps (case-insensitive)
+    spd_hdr_idx = _header_index(list(spd_rows[0].keys()))
+    safety_hdr_idx = _header_index(list(safety_rows[0].keys())) if safety_rows else {}
+    perf_hdr_idx = _header_index(list(perf_rows[0].keys())) if perf_rows else {}
+    harms_hdr_idx = _header_index(list(harms_rows[0].keys())) if harms_rows else {}
+    follow_hdr_idx = _header_index(list(follow_rows[0].keys())) if follow_rows else {}
+
+    # Grouping helpers
+    def key_tuple(*vals: str) -> Tuple[str, ...]:
+        return tuple((v or "").strip() for v in vals)
+
+    # Group rows
+    spd_by_refid: Dict[str, List[Dict[str, str]]] = {}
+    for r in spd_rows:
+        rf = (r.get("refid") or "").strip()
+        if rf:
+            spd_by_refid.setdefault(rf, []).append(r)
+
+    safety_by_refid_spd: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for r in safety_rows:
+        safety_by_refid_spd.setdefault(key_tuple(r.get("refid"), r.get("spd_id")), []).append(r)
+
+    perf_by_refid_spd: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for r in perf_rows:
+        perf_by_refid_spd.setdefault(key_tuple(r.get("refid"), r.get("spd_id")), []).append(r)
+
+    harms_by_refid_spd_safety: Dict[Tuple[str, str, str], List[Dict[str, str]]] = {}
+    for r in harms_rows:
+        harms_by_refid_spd_safety.setdefault(
+            key_tuple(r.get("refid"), r.get("spd_id"), r.get("safety_id")), []
+        ).append(r)
+
+    follow_by_refid_spd: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for r in follow_rows:
+        follow_by_refid_spd.setdefault(key_tuple(r.get("refid"), r.get("spd_id")), []).append(r)
+
+    # Build output
+    output: List[Dict[str, Any]] = []
+
+    for refid, spd_list in spd_by_refid.items():
+        # Clone top record
+        top = _deepcopy(master)
+        top["refid"] = refid
+        top["data_sets"] = {}
+
+        # Prepare fresh Extraction dataset
+        new_extr_id = ids.next()
+        extr_node = _deepcopy(extraction_proto)
+        extr_node["key"] = str(refid)
+        extr_node["child_forms"] = {}
+
+        # Update Article Identifier if present
+        for datum in extr_node.get("data", []) or []:
+            if _normalize(datum.get("question", "")) == _normalize("Article Identifier"):
+                _set_response(datum, refid)
+
+        top["data_sets"][new_extr_id] = extr_node
+        extr_children = extr_node["child_forms"]
+
+        # Sort SPD list deterministically by numeric spd_id when possible
+        def spd_sort_key(r: Dict[str, str]):
+            v = (r.get("spd_id") or "").strip()
+            return (0, int(v)) if v.isdigit() else (1, v)
+        spd_list_sorted = sorted(spd_list, key=spd_sort_key)
+
+        for srow in spd_list_sorted:
+            spd_id_val = (srow.get("spd_id") or "").strip()
+            if not spd_id_val:
+                continue
+            try:
+                n = int(spd_id_val)
+                spd_name = f"spd_{n}"
+            except Exception:
+                spd_name = f"spd_{spd_id_val}"
+
+            new_spd_key = ids.next()
+            spd_node = _deepcopy(spd_proto)
+            spd_node["key"] = spd_name
+
+            _populate_form_from_row(spd_node, srow, spd_hdr_idx, spd_label_override=spd_name)
+            spd_node["child_forms"] = {}
+            extr_children[new_spd_key] = spd_node
+
+            # SAFETY forms under SPD
+            if safety_id_under_spd and (refid, spd_id_val) in safety_by_refid_spd:
+                safety_rows_here = safety_by_refid_spd[(refid, spd_id_val)]
+                safety_template_node = _deepcopy(safety_proto)
+                for r in safety_rows_here:
+                    new_safe_key = ids.next()
+                    safe_node = _deepcopy(safety_template_node)
+                    ae_val = r.get("Adverse Event", "") or r.get("adverse_event", "")
+                    safe_node["key"] = f"{spd_name}\n{ae_val}".strip()
+                    _populate_form_from_row(safe_node, r, safety_hdr_idx)
+                    safe_node["child_forms"] = {}
+
+                    # HARMS subforms matched by safety_id
+                    s_id = (r.get("safety_id") or "").strip()
+                    if harms_id_under_safety and (refid, spd_id_val, s_id) in harms_by_refid_spd_safety:
+                        harms_template = _deepcopy(safety_children.get(harms_id_under_safety, {}))
+                        for h in harms_by_refid_spd_safety[(refid, spd_id_val, s_id)]:
+                            new_harm_key = ids.next()
+                            harm_node = _deepcopy(harms_template)
+                            harm_node["key"] = f"{spd_name}\n{s_id}".strip()
+                            _populate_form_from_row(harm_node, h, harms_hdr_idx)
+                            safe_node["child_forms"][new_harm_key] = harm_node
+
+                    spd_node["child_forms"][new_safe_key] = safe_node
+
+            # PERFORMANCE (discrete) under SPD
+            if perf_id_under_spd and (refid, spd_id_val) in perf_by_refid_spd:
+                perf_template_node = _deepcopy(spd_children.get(perf_id_under_spd, {}))
+                for r in perf_by_refid_spd[(refid, spd_id_val)]:
+                    new_perf_key = ids.next()
+                    perf_node = _deepcopy(perf_template_node)
+                    endpoint = r.get("Perf Discrete Endpoint", "") or r.get("perf discrete endpoint", "")
+                    tpoint = r.get("Perf Discrete Time Point", "") or r.get("perf discrete time point", "")
+                    perf_node["key"] = f"{spd_name}\n{endpoint}-{tpoint}".strip("-").strip()
+                    _populate_form_from_row(perf_node, r, perf_hdr_idx)
+                    spd_node["child_forms"][new_perf_key] = perf_node
+
+            # FOLLOW-UP under SPD (optional)
+            if follow_id_under_spd and (refid, spd_id_val) in follow_by_refid_spd:
+                follow_template_node = _deepcopy(spd_children.get(follow_id_under_spd, {}))
+                for r in follow_by_refid_spd[(refid, spd_id_val)]:
+                    new_follow_key = ids.next()
+                    follow_node = _deepcopy(follow_template_node)
+                    follow_node["key"] = f"{spd_name}\nFollow-up"
+                    _populate_form_from_row(follow_node, r, follow_hdr_idx)
+                    spd_node["child_forms"][new_follow_key] = follow_node
+
+        output.append(top)
+
+    logp(f"Built {len(output)} top-level record(s).")
+    return output
+
+# --------------------------------------------- GUI ------------------------------------------- #
+
+def launch_gui() -> None:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    def browse_file(entry, types):
+        p = filedialog.askopenfilename(filetypes=types)
+        if p:
+            entry.delete(0, tk.END)
+            entry.insert(0, p)
+
+    def browse_save(entry):
+        p = filedialog.asksaveasfilename(defaultextension=".json",
+                                         filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if p:
+            entry.delete(0, tk.END)
+            entry.insert(0, p)
+
+    def log(msg: str):
+        txt.configure(state="normal")
+        txt.insert("end", msg + "\n")
+        txt.see("end")
+        txt.configure(state="disabled")
+        root.update_idletasks()
+
+    def run_build():
+        tpath = ent_tmpl.get().strip()
+        spd = ent_spd.get().strip()
+        safety = ent_safety.get().strip()
+        perf = ent_perf.get().strip()
+        harms = ent_harms.get().strip()
+        follow = ent_follow.get().strip()
+        outp = ent_out.get().strip()
+
+        if not tpath or not os.path.exists(tpath):
+            messagebox.showerror("Error", "Select a valid template.json")
+            return
+        if not spd or not os.path.exists(spd):
+            messagebox.showerror("Error", "Select 'Study and Patient Demographics.csv'")
+            return
+        if not safety or not os.path.exists(safety):
+            messagebox.showerror("Error", "Select 'Safety.csv'")
+            return
+        if not perf or not os.path.exists(perf):
+            messagebox.showerror("Error", "Select 'Performance (discrete).csv'")
+            return
+        if not harms or not os.path.exists(harms):
+            messagebox.showerror("Error", "Select 'Harms.csv'")
+            return
+        if not outp:
+            messagebox.showerror("Error", "Choose an output JSON path")
+            return
+
+        try:
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.configure(state="disabled")
+            log("Building JSON...")
+
+            records = build_from_files(
+                template_path=tpath,
+                spd_csv=spd,
+                safety_csv=safety,
+                perf_csv=perf,
+                harms_csv=harms,
+                follow_csv=follow if follow else None,
+                zero_pad_spd=False,
+                log=log
+            )
+
+            write_json(outp, records)
+            log(f"Done. Wrote: {outp}")
+            messagebox.showinfo("Success", f"JSON built successfully.\n\n{outp}")
+        except Exception as e:
+            log(f"ERROR: {e}")
+            messagebox.showerror("Error", str(e))
+
+    root = tk.Tk()
+    root.title("Build JSON from CSVs (Template-driven)")
+    pad = {"padx": 6, "pady": 6}
+
+    frm = ttk.Frame(root)
+    frm.pack(fill="both", expand=True, **pad)
+
+    def row(label, types):
+        r = ttk.Frame(frm); r.pack(fill="x", expand=True, **pad)
+        ttk.Label(r, text=label, width=28, anchor="w").pack(side="left")
+        e = ttk.Entry(r, width=60); e.pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="Browse", command=lambda: browse_file(e, types)).pack(side="left", padx=4)
+        return e
+
+    ent_tmpl   = row("Template JSON:", (("JSON files", "*.json"), ("All files", "*.*")))
+    ent_spd    = row("Study and Patient Demographics CSV:", (("CSV files", "*.csv"), ("All files", "*.*")))
+    ent_follow = row("Follow-up Subform CSV (optional):", (("CSV files", "*.csv"), ("All files", "*.*")))
+    ent_safety = row("Safety CSV:", (("CSV files", "*.csv"), ("All files", "*.*")))
+    ent_perf   = row("Performance (discrete) CSV:", (("CSV files", "*.csv"), ("All files", "*.*")))
+    ent_harms  = row("Harms CSV:", (("CSV files", "*.csv"), ("All files", "*.*")))
+
+    r_out = ttk.Frame(frm); r_out.pack(fill="x", expand=True, **pad)
+    ttk.Label(r_out, text="Output JSON:", width=28, anchor="w").pack(side="left")
+    ent_out = ttk.Entry(r_out, width=60); ent_out.pack(side="left", fill="x", expand=True)
+
+    def save_as():
+        browse_save(ent_out)
+    ttk.Button(r_out, text="Save As", command=save_as).pack(side="left", padx=4)
+
+    ttk.Separator(frm).pack(fill="x", pady=6)
+    ttk.Button(frm, text="Build JSON", command=run_build).pack(anchor="e", padx=6, pady=6)
+
+    txt = tk.Text(frm, height=12, state="disabled", wrap="word")
+    txt.pack(fill="both", expand=True, **pad)
+
+    root.minsize(780, 520)
+    root.mainloop()
+
+# ---------------------------------------------- CLI ------------------------------------------ #
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Build JSON from CSVs based on a template JSON structure.")
+    p.add_argument("--template", required=False, help="Path to template.json")
+    p.add_argument("--spd", required=False, help="Path to 'Study and Patient Demographics.csv'")
+    p.add_argument("--safety", required=False, help="Path to 'Safety.csv'")
+    p.add_argument("--perf", required=False, help="Path to 'Performance (discrete).csv'")
+    p.add_argument("--harms", required=False, help="Path to 'Harms.csv'")
+    p.add_argument("--followup", required=False, help="Path to 'Follow-up Subform.csv'")
+    p.add_argument("--out", required=False, help="Output JSON path (e.g., out.json)")
+    p.add_argument("--gui", action="store_true", default=False, help="Launch GUI (default if no args).")
+    return p.parse_args(argv)
+
+def main():
+    args = parse_args()
+    if (args.template and args.spd and args.safety and args.perf and args.harms and args.out) and not args.gui:
+        recs = build_from_files(
+            template_path=args.template,
+            spd_csv=args.spd,
+            safety_csv=args.safety,
+            perf_csv=args.perf,
+            harms_csv=args.harms,
+            follow_csv=args.followup,
+            zero_pad_spd=False,
+            log=lambda m: print(m, file=sys.stderr)
+        )
+        write_json(args.out, recs)
+        print(f"Wrote {args.out}")
+    else:
+        launch_gui()
+
+if __name__ == "__main__":
+    main()
+PYCODE
+      - name: Preflight syntax check
+        shell: bash
+        run: |
+          python -m py_compile build_json_gui.py
+      - name: Build EXE (windowed, onefile)
+        shell: bash
+        run: |
+          python -m PyInstaller --clean --noconfirm --onefile --windowed build_json_gui.py
+          ls -la dist || true
+          test -f dist/build_json_gui.exe
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_json_gui-exe
+          path: dist/build_json_gui.exe
+          if-no-files-found: error
