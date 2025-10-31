@@ -18,14 +18,14 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          # Do not turn on pip-install auto feature; we'll install manually.
+          # Do not enable pip-install here; we'll install manually.
 
-      # ⬇️ Write your uploaded build_json_gui_V1.py into app/build_json_gui.py via heredoc
+      # Write your uploaded build_json_gui_V1.py into app/build_json_gui.py via a bash heredoc
       - name: Create app script via heredoc (rollback to V1)
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path app | Out-Null
-          @'
+          mkdir -p app
+          cat > app/build_json_gui.py <<'PY'
 # build_json_gui.py
 # JSON builder GUI for DistillerSR-like template
 # - SP&D under Extraction.child_forms keyed as "spd_XX"
@@ -343,7 +343,7 @@ class App(tk.Tk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
-'@ | Set-Content -NoNewline -Encoding UTF8 app/build_json_gui.py
+PY
 
       - name: Install PyInstaller
         shell: pwsh
