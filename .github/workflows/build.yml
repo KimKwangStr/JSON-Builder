@@ -1,13 +1,13 @@
 name: Build JSON GUI EXE
 
 on:
-  workflow_dispatch:        # allow manual runs from the Actions tab
+  workflow_dispatch:
   push:
-    branches: [ main ]      # build automatically on pushes to main
+    branches: [ main ]
 
 jobs:
   build-windows:
-    runs-on: windows-latest   # build on Windows for a Windows .exe
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -17,25 +17,26 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-          cache: 'pip'         # speeds up dependency installs
-      # setup-python is the GitHub-recommended way to install Python on runners.
-      # https://github.com/marketplace/actions/setup-python
+          cache: 'pip'   # optional: speeds up pip installs
+          # DO NOT set: pip-install: true
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          if (Test-Path "requirements.txt") { pip install -r requirements.txt }
+          if (Test-Path "requirements.txt") {
+            pip install -r requirements.txt
+          } else {
+            # Minimal deps for this app
+            pip install pandas
+          }
           pip install pyinstaller
 
       - name: Build EXE with PyInstaller
+        shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile `
-            --name json-builder `
+          pyinstaller --noconfirm --onefile --name json-builder `
             app/json_builder_gui.py
-      # PyInstaller --onefile bundles everything into a single executable.
-      # PyInstaller is not a cross-compiler; build on the target OS.
-      # https://pyinstaller.org/en/stable/usage.html
-      # https://pyinstaller.org/en/stable/index.html
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
