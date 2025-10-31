@@ -8,6 +8,7 @@
 import json, csv, copy, tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Tuple, Set
+from collections import defaultdict
 
 USER_NAME = "KimKwang"
 
@@ -27,10 +28,9 @@ def read_csv(path: str) -> List[Dict[str,str]]:
     return rows
 
 def deep_clone(obj: Any) -> Any:
-    return copy.deepcopy(obj)
+    return json.loads(json.dumps(obj))
 
 class TemplateForms:
-    """Learn prototypes from template.json in the exact places your template uses."""
     def __init__(self, template_obj: Any):
         if isinstance(template_obj, list): root = template_obj[0]
         elif isinstance(template_obj, dict): root = template_obj
@@ -47,7 +47,6 @@ class TemplateForms:
         self.harms_proto = None
         self.followup_proto = None
 
-        # Extraction → child_forms
         for _, v in (self.extraction_proto.get("child_forms", {}) or {}).items():
             name = (v.get("form") or "").strip()
             if name == "Study Parameters and Demographics":
@@ -59,7 +58,6 @@ class TemplateForms:
             elif name == "Follow-up Subform":
                 self.followup_proto = deep_clone(v)
 
-        # SP&D → child_forms (your template puts Safety/Perf/Follow-up here)
         if self.spd_proto:
             for _, v in (self.spd_proto.get("child_forms", {}) or {}).items():
                 nm = (v.get("form") or "").strip()
@@ -70,7 +68,6 @@ class TemplateForms:
                 if nm == "Performance (discrete)" and self.perf_discrete_proto is None:
                     self.perf_discrete_proto = deep_clone(v)
 
-        # Safety → child_forms → Harms
         if self.safety_proto:
             for _, v in (self.safety_proto.get("child_forms", {}) or {}).items():
                 if (v.get("form") or "").strip() == "Harms":
@@ -146,7 +143,6 @@ class JSONBuilder:
             frm["data"].append({"question": col, "type": "Text",
                                 "response":{"answer":"", "text": val}})
         return frm
-
     def _collect_all_pairs(self,
                            spd_rows: List[Dict[str,str]],
                            safety_rows: List[Dict[str,str]],
@@ -156,9 +152,9 @@ class JSONBuilder:
         def add(refid: str, spd_id: str):
             if not refid or not spd_id: return
             pairs.setdefault(refid, set()).add(spd_id)
-        for r in spd_rows:    add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in safety_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in perf_rows:   add(r.get("refid","").strip(), r.get("spd_id","").strip())
+        for r in spd_rows:      add(r.get("refid","").strip(), r.get("spd_id","").strip())
+        for r in safety_rows:   add(r.get("refid","").strip(), r.get("spd_id","").strip())
+        for r in perf_rows:     add(r.get("refid","").strip(), r.get("spd_id","").strip())
         for r in followup_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
         return pairs
 
@@ -169,7 +165,6 @@ class JSONBuilder:
               perf_rows: List[Dict[str, str]],
               harms_rows: List[Dict[str, str]],
               followup_rows: List[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-
         followup_rows = followup_rows or []
 
         # Grouping
@@ -178,27 +173,24 @@ class JSONBuilder:
             key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
             if key[0] and key[1]: spd_rows_by_pair[key] = r
 
-        safety_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+        safety_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
         for r in safety_rows:
-            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
-            safety_by_pair.setdefault(key, []).append(r)
+            safety_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
 
-        harms_by_safety_id: Dict[str, List[Dict[str, str]]] = {}
+        harms_by_safety_id: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         for r in harms_rows:
             sid = (r.get("safety_id") or "").strip()
-            if sid: harms_by_safety_id.setdefault(sid, []).append(r)
+            if sid: harms_by_safety_id[sid].append(r)
 
-        perf_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+        perf_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
         for r in perf_rows:
-            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
-            perf_by_pair.setdefault(key, []).append(r)
+            perf_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
 
-        followup_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
-        for r in followup_rows:
-            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
-            followup_by_pair.setdefault(key, []).append(r)
+        followup_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
+        for r in (followup_rows or []):
+            followup_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
 
-        # Collect all refid->spd_id pairs from any CSV as anchors
+        # Anchors from ALL CSVs so Safety/Perf create parents when needed
         pairs_by_refid = self._collect_all_pairs(spd_rows, safety_rows, perf_rows, followup_rows)
 
         out: List[Dict[str, Any]] = []
@@ -210,15 +202,13 @@ class JSONBuilder:
             extraction["child_forms"] = {}
 
             self.log(f"REFID {refid}: building {len(spd_ids)} SP&D form(s)")
-
             for spd_id in sorted(spd_ids, key=lambda x: (len(x), x)):
                 pair = (refid, spd_id)
-                s_count = len(safety_by_pair.get(pair, []))
-                p_count = len(perf_by_pair.get(pair, []))
-                f_count = len(followup_by_pair.get(pair, []))
-                self.log(f"  SP&D spd_{spd_id}: Safety rows={s_count}, Perf rows={p_count}, Follow-up rows={f_count}")
+                self.log(f"  SP&D spd_{spd_id}: Safety={len(safety_by_pair.get(pair,[]))}, "
+                         f"Perf={len(perf_by_pair.get(pair,[]))}, "
+                         f"Follow-up={len(followup_by_pair.get(pair,[]))}")
 
-                # SP&D form (from CSV row if present, else empty from proto)
+                # SP&D (from CSV if present, else empty-from-proto)
                 if self.t.spd_proto is None:
                     raise ValueError("Template missing Study Parameters and Demographics prototype.")
                 if pair in spd_rows_by_pair:
@@ -230,41 +220,39 @@ class JSONBuilder:
                 extraction["child_forms"][f"spd_{spd_id}"] = spd_form
 
                 # Performance (discrete)
-                for perf_row in perf_by_pair.get(pair, []):
+                for prow in perf_by_pair.get(pair, []):
                     if self.t.perf_discrete_proto is not None:
-                        perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, perf_row)
-                        perf_form["key"]  = f"perf_{self._gen_id()}"; perf_form["form"]="Performance (discrete)"
-                        perf_form["user"] = USER_NAME
+                        perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, prow)
+                        perf_form["key"]=f"perf_{self._gen_id()}"; perf_form["form"]="Performance (discrete)"
+                        perf_form["user"]=USER_NAME
                     else:
-                        perf_form = self._generic_form_from_row("Performance (discrete)", perf_row, is_subform=0, level=1)
+                        perf_form = self._generic_form_from_row("Performance (discrete)", prow, is_subform=0, level=1)
                     spd_form["child_forms"][self._gen_id()] = perf_form
-                    self.log(f"    + Performance (discrete) added for pair {pair}")
+                    self.log(f"    + Performance (discrete) added for {pair}")
 
                 # Safety + Harms
                 for srow in safety_by_pair.get(pair, []):
-                    safety_id = (srow.get("safety_id") or "").strip()
+                    sid = (srow.get("safety_id") or "").strip()
                     if self.t.safety_proto is not None:
-                        safety_form = self._populate_form_from_row(self.t.safety_proto, srow)
-                        safety_form["form"]="Safety"; safety_form["user"]=USER_NAME
-                        safety_form["key"]=f"safety_{safety_id or self._gen_id()}"; safety_form["child_forms"]={}
+                        sform = self._populate_form_from_row(self.t.safety_proto, srow)
+                        sform["form"]="Safety"; sform["user"]=USER_NAME
+                        sform["key"]=f"safety_{sid or self._gen_id()}"; sform["child_forms"]={}
                     else:
-                        safety_form = self._generic_form_from_row("Safety", srow, is_subform=0, level=1)
+                        sform = self._generic_form_from_row("Safety", srow, is_subform=0, level=1)
 
-                    # Harms by safety_id
-                    harms_list = 0
-                    for hrow in harms_by_safety_id.get(safety_id, []):
+                    harms_added = 0
+                    for hrow in harms_by_safety_id.get(sid, []):
                         if self.t.harms_proto is not None:
-                            harms_form = self._populate_form_from_row(self.t.harms_proto, hrow)
-                            harms_form["form"]="Harms"; harms_form["user"]=USER_NAME
-                            harms_form["key"]=f"harms_{self._gen_id()}"
+                            hform = self._populate_form_from_row(self.t.harms_proto, hrow)
+                            hform["form"]="Harms"; hform["user"]=USER_NAME; hform["key"]=f"harms_{self._gen_id()}"
                         else:
-                            harms_form = self._generic_form_from_row("Harms", hrow, is_subform=1, level=1)
-                        safety_form["child_forms"][self._gen_id()] = harms_form
-                        harms_list += 1
-                    spd_form["child_forms"][self._gen_id()] = safety_form
-                    self.log(f"    + Safety added for pair {pair} (harms linked={harms_list})")
+                            hform = self._generic_form_from_row("Harms", hrow, is_subform=1, level=1)
+                        sform["child_forms"][self._gen_id()] = hform; harms_added += 1
 
-                # Follow-up Subform (only if follow-up rows provided)
+                    spd_form["child_forms"][self._gen_id()] = sform
+                    self.log(f"    + Safety added for {pair} (harms linked={harms_added})")
+
+                # Follow-up Subform (if provided)
                 for fu_row in followup_by_pair.get(pair, []):
                     if self.t.followup_proto is not None:
                         fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
@@ -273,7 +261,7 @@ class JSONBuilder:
                     else:
                         fu_form = self._generic_form_from_row("Follow-up Subform", fu_row, is_subform=1, level=1)
                     spd_form["child_forms"][self._gen_id()] = fu_form
-                    self.log(f"    + Follow-up Subform added for pair {pair}")
+                    self.log(f"    + Follow-up Subform added for {pair}")
 
             root["data_sets"][ds_id] = extraction
             out.append(root)
@@ -284,7 +272,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("JSON Builder from CSVs")
-        self.geometry("840x600")
+        self.geometry("860x600")
         self.template_path = tk.StringVar()
         self.spd_path = tk.StringVar()
         self.safety_path = tk.StringVar()
@@ -296,7 +284,7 @@ class App(tk.Tk):
 
     def _row(self, r, label, var, filetypes):
         tk.Label(self, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=6)
-        tk.Entry(self, textvariable=var, width=84).grid(row=r, column=1, padx=10)
+        tk.Entry(self, textvariable=var, width=88).grid(row=r, column=1, padx=10)
         def browse():
             p = filedialog.askopenfilename(filetypes=filetypes)
             if p: var.set(p)
@@ -319,8 +307,7 @@ class App(tk.Tk):
 
         self.log = tk.Text(self, height=16)
         self.log.grid(row=9, column=0, columnspan=3, sticky="nsew", padx=10, pady=8)
-        self.grid_rowconfigure(9, weight=1)
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(9, weight=1); self.grid_columnconfigure(1, weight=1)
         tk.Button(self, text="Build JSON", command=self.on_build).grid(row=10, column=2, sticky="e", padx=8, pady=10)
 
     def logmsg(self, msg: str):
@@ -332,16 +319,11 @@ class App(tk.Tk):
 
     def on_build(self):
         try:
-            if not self.template_path.get():
-                messagebox.showerror("Missing", "Please select the template JSON file."); return
-            if not self.safety_path.get():
-                messagebox.showerror("Missing", "Please select the Safety CSV file."); return
-            if not self.perf_path.get():
-                messagebox.showerror("Missing", "Please select the Performance (discrete) CSV file."); return
-            if not self.harms_path.get():
-                messagebox.showerror("Missing", "Please select the Harms CSV file."); return
-            if not self.out_path.get():
-                messagebox.showerror("Missing", "Please choose an output JSON path."); return
+            if not self.template_path.get(): messagebox.showerror("Missing", "Please select the template JSON file."); return
+            if not self.safety_path.get():   messagebox.showerror("Missing", "Please select the Safety CSV file."); return
+            if not self.perf_path.get():     messagebox.showerror("Missing", "Please select the Performance (discrete) CSV file."); return
+            if not self.harms_path.get():    messagebox.showerror("Missing", "Please select the Harms CSV file."); return
+            if not self.out_path.get():      messagebox.showerror("Missing", "Please choose an output JSON path."); return
 
             self.logmsg("Loading template...")
             template_obj = read_json(self.template_path.get())
@@ -377,11 +359,10 @@ class App(tk.Tk):
             self.logmsg("Writing output...")
             write_json(self.out_path.get(), out_list)
             messagebox.showinfo("Success", "JSON built successfully and saved to:\n" + str(self.out_path.get()))
-
         except Exception as e:
-            messagebox.showerror("Error", str(e))
-            self.logmsg(f"ERROR: {e}")
+            messagebox.showerror("Error", str(e)); self.logmsg(f"ERROR: {e}")
 
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+``
