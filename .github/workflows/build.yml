@@ -13,13 +13,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ✅ Guard step to satisfy setup-python if pip-install is forced by org policy
+      - name: (Guard) Ensure requirements.txt exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "requirements.txt")) {
+            # minimal dependency; you can add others if you like
+            "pandas" | Out-File -Encoding utf8 requirements.txt
+          }
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
-          # IMPORTANT: do not enable pip-install here
-          # pip-install: false  # (not needed if you omit it)
+          # If your org forces pip-install, this step will now find requirements.txt and succeed.
+          # If not forced, this step simply sets up Python and we install deps explicitly below.
 
       # ⬇️ Writes the latest app/build_json_gui.py via heredoc
       - name: Create app script via heredoc
@@ -82,6 +91,7 @@ jobs:
                   return pd.isna(x) or (isinstance(x, float) and math.isnan(x))
               except Exception:
                   return False
+
           def norm(val):
               if val is None or is_nan(val):
                   return None
@@ -219,8 +229,12 @@ jobs:
 
                           for _, srow in (safety_rows or []).iterrows():
                               safety_id_val = srow["safety_id"] if "safety_id" in srow else None
-                              ae = srow.get("Adverse Event", "") if hasattr(srow, "get") else srow.get("Adverse Event", "")
-                              s_key = f"safety_{safety_id_val}" if safety_id_val else (f"{spd_key}\\n{ae}" if ae else f"{spd_key}\\nSafety")
+                              # Attempt a descriptive key if AE is present
+                              try:
+                                  ae = srow.get("Adverse Event", "")
+                              except Exception:
+                                  ae = ""
+                              s_key = f"safety_{safety_id_val}" if safety_id_val else (f"{spd_key}\n{ae}" if ae else f"{spd_key}\nSafety")
 
                               safety_form_id = next_id(counter)
                               safety_form = new_form("Safety", s_key, is_subform=False)
@@ -237,7 +251,7 @@ jobs:
                                   harms_rows = harms_df.loc[harms_df["safety_id"] == str(safety_id_val)]
                                   for _, hrow in harms_rows.iterrows():
                                       harms_form_id = next_id(counter)
-                                      harms_key = f"{s_key}\\nHarms"
+                                      harms_key = f"{s_key}\nHarms"
                                       harms_form = new_form("Harms", harms_key, is_subform=True)
 
                                       for col in harms_rows.columns:
@@ -259,7 +273,7 @@ jobs:
                           for _, prow in (perf_rows or []).iterrows():
                               endpoint = prow.get("Perf Discrete Endpoint") if "Perf Discrete Endpoint" in perf_rows.columns else None
                               timept = prow.get("Perf Discrete Time Point") if "Perf Discrete Time Point" in perf_rows.columns else None
-                              p_key = f"{spd_key}\\n{endpoint or 'Performance'}" + (f"-{timept}" if timept else "")
+                              p_key = f"{spd_key}\n{endpoint or 'Performance'}" + (f"-{timept}" if timept else "")
 
                               perf_form_id = next_id(counter)
                               perf_form = new_form("Performance (discrete)", p_key, is_subform=False)
@@ -278,7 +292,7 @@ jobs:
                           if fol_rows is not None and not fol_rows.empty:
                               for _, frow in fol_rows.iterrows():
                                   fol_id = next_id(counter)
-                                  fu_form = new_form("Follow-up Subform", f"{spd_key}\\nFollow-up", is_subform=True)
+                                  fu_form = new_form("Follow-up Subform", f"{spd_key}\nFollow-up", is_subform=True)
                                   for col in fol_rows.columns:
                                       if col in skip_cols:
                                           continue
@@ -385,11 +399,9 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
-          } else {
-            pip install pandas
-          }
+          # We still install explicitly; if setup-python already installed from requirements.txt,
+          # pip will be a no-op here.
+          pip install -r requirements.txt
           pip install pyinstaller
 
       - name: Build EXE with PyInstaller
