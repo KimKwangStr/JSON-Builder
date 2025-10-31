@@ -11,7 +11,7 @@ import csv
 import copy
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Set
 
 USER_NAME = "KimKwang"
 
@@ -92,7 +92,6 @@ class TemplateForms:
                 if (v.get("form") or "").strip() == "Harms":
                     self.harms_proto = deep_clone(v)
                     break
-
     def question_types(self, form_proto: Dict[str, Any]) -> Dict[str, str]:
         out: Dict[str, str] = {}
         for q in form_proto.get("data", []) or []:
@@ -121,6 +120,22 @@ class JSONBuilder:
                 r["text"] = str(refid)
         ds["child_forms"] = {}
         return ds
+
+    def _empty_from_proto(self, form_proto: Dict[str, Any]) -> Dict[str, Any]:
+        """Clone a form prototype and clear all answers."""
+        form = deep_clone(form_proto)
+        form["user"] = USER_NAME
+        cleared = []
+        for q in form.get("data", []) or []:
+            cleared.append({
+                "question": q.get("question",""),
+                "type": q.get("type","Text"),
+                "response": {"answer":"", "text":""}
+            })
+        form["data"] = cleared
+        if "child_forms" not in form:
+            form["child_forms"] = {}
+        return form
 
     def _populate_form_from_row(self, form_proto: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
         """Clone a form prototype and fill its data[] by matching CSV headers to question texts."""
@@ -175,6 +190,26 @@ class JSONBuilder:
             })
         return frm
 
+    def _collect_all_pairs(self,
+                           spd_rows: List[Dict[str,str]],
+                           safety_rows: List[Dict[str,str]],
+                           perf_rows: List[Dict[str,str]],
+                           followup_rows: List[Dict[str,str]]) -> Dict[str, Set[str]]:
+        """
+        Build a dictionary refid -> set(spd_id) from all CSVs,
+        so we can create SP&D even if SP&D CSV is missing those pairs.
+        """
+        pairs: Dict[str, Set[str]] = {}
+        def add(refid: str, spd_id: str):
+            if not refid or not spd_id: return
+            pairs.setdefault(refid, set()).add(spd_id)
+
+        for r in spd_rows:    add(r.get("refid","").strip(), r.get("spd_id","").strip())
+        for r in safety_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
+        for r in perf_rows:   add(r.get("refid","").strip(), r.get("spd_id","").strip())
+        for r in followup_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
+        return pairs
+
     def build(self,
               template_root: Dict[str, Any],
               spd_rows: List[Dict[str, str]],
@@ -184,18 +219,17 @@ class JSONBuilder:
               followup_rows: List[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         followup_rows = followup_rows or []
 
-        # Group by keys
-        spd_by_refid: Dict[str, List[Dict[str, str]]] = {}
+        # Grouping
+        spd_rows_by_pair: Dict[Tuple[str,str], Dict[str,str]] = {}
         for r in spd_rows:
-            rf = (r.get("refid") or "").strip()
-            if rf:
-                spd_by_refid.setdefault(rf, []).append(r)
+            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
+            if key[0] and key[1]:
+                spd_rows_by_pair[key] = r
 
-        safety_by_key: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+        safety_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
         for r in safety_rows:
-            rf = (r.get("refid") or "").strip()
-            spd = (r.get("spd_id") or "").strip()
-            safety_by_key.setdefault((rf, spd), []).append(r)
+            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
+            safety_by_pair.setdefault(key, []).append(r)
 
         harms_by_safety_id: Dict[str, List[Dict[str, str]]] = {}
         for r in harms_rows:
@@ -203,44 +237,47 @@ class JSONBuilder:
             if sid:
                 harms_by_safety_id.setdefault(sid, []).append(r)
 
-        perf_by_key: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+        perf_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
         for r in perf_rows:
-            rf = (r.get("refid") or "").strip()
-            spd = (r.get("spd_id") or "").strip()
-            perf_by_key.setdefault((rf, spd), []).append(r)
+            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
+            perf_by_pair.setdefault(key, []).append(r)
 
-        followup_by_key: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+        followup_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
         for r in followup_rows:
-            rf = (r.get("refid") or "").strip()
-            spd = (r.get("spd_id") or "").strip()
-            followup_by_key.setdefault((rf, spd), []).append(r)
+            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
+            followup_by_pair.setdefault(key, []).append(r)
+
+        # Collect all refid->spd_id pairs from any CSV as anchors
+        pairs_by_refid = self._collect_all_pairs(spd_rows, safety_rows, perf_rows, followup_rows)
 
         out: List[Dict[str, Any]] = []
-        for refid, spd_list in spd_by_refid.items():
+        for refid, spd_ids in pairs_by_refid.items():
+            # Start a new top-level record for each refid
             root = {"refid": int(refid) if refid.isdigit() else refid,
                     "tags": [], "attachments": [], "biblio_string": "", "data_sets": {}}
             ds_id = self._gen_id()
             extraction = self._make_extraction(refid)
             extraction["child_forms"] = {}
 
-            for spd_row in spd_list:
-                spd_id = (spd_row.get("spd_id") or "").strip()
-                if not spd_id:
-                    continue
-                # --- SP&D (prototype required) ---
+            for spd_id in sorted(spd_ids, key=lambda x: (len(x), x)):
+                pair = (refid, spd_id)
+
+                # --- SP&D (use CSV row if present, else minimal from prototype) ---
                 if self.t.spd_proto is None:
                     raise ValueError("Template missing Study Parameters and Demographics prototype.")
-                spd_form = self._populate_form_from_row(self.t.spd_proto, spd_row)
+                if pair in spd_rows_by_pair:
+                    spd_form = self._populate_form_from_row(self.t.spd_proto, spd_rows_by_pair[pair])
+                else:
+                    spd_form = self._empty_from_proto(self.t.spd_proto)
+
                 spd_form["key"] = f"spd_{spd_id}"
                 spd_form["form"] = "Study Parameters and Demographics"
                 spd_form["user"] = USER_NAME
                 spd_form["child_forms"] = {}
-
-                # Place SP&D under extraction.child_forms with "spd_XX" key
                 extraction["child_forms"][f"spd_{spd_id}"] = spd_form
 
-                # --- Performance (discrete) forms under SP&D ---
-                for perf_row in perf_by_key.get((refid, spd_id), []):
+                # --- Performance (discrete) under SP&D ---
+                for perf_row in perf_by_pair.get(pair, []):
                     if self.t.perf_discrete_proto is not None:
                         perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, perf_row)
                         perf_form["key"]  = f"perf_{self._gen_id()}"
@@ -250,10 +287,9 @@ class JSONBuilder:
                         perf_form = self._generic_form_from_row("Performance (discrete)", perf_row, is_subform=0, level=1)
                     spd_form["child_forms"][self._gen_id()] = perf_form
 
-                # --- Safety (+ Harms) forms under SP&D ---
-                for srow in safety_by_key.get((refid, spd_id), []):
+                # --- Safety (+ Harms) under SP&D ---
+                for srow in safety_by_pair.get(pair, []):
                     safety_id = (srow.get("safety_id") or "").strip()
-
                     if self.t.safety_proto is not None:
                         safety_form = self._populate_form_from_row(self.t.safety_proto, srow)
                         safety_form["form"] = "Safety"
@@ -277,7 +313,7 @@ class JSONBuilder:
                     spd_form["child_forms"][self._gen_id()] = safety_form
 
                 # --- Follow-up Subform (prototype preferred) ---
-                for fu_row in followup_by_key.get((refid, spd_id), []):
+                for fu_row in followup_by_pair.get(pair, []):
                     if self.t.followup_proto is not None:
                         fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
                         fu_form["form"] = "Follow-up Subform"
@@ -320,7 +356,7 @@ class App(tk.Tk):
     def _build_ui(self):
         self._row(0, "Template JSON:", self.template_path, [("JSON","*.json")])
         ttk.Separator(self, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
-        self._row(2, "Study and Patient Demographics CSV:", self.spd_path, [("CSV","*.csv")])
+        self._row(2, "Study and Patient Demographics CSV (optional):", self.spd_path, [("CSV","*.csv")])
         self._row(3, "Follow-up Subform CSV (optional):", self.followup_path, [("CSV","*.csv")])
         self._row(4, "Safety CSV:", self.safety_path, [("CSV","*.csv")])
         self._row(5, "Performance (discrete) CSV:", self.perf_path, [("CSV","*.csv")])
@@ -352,9 +388,6 @@ class App(tk.Tk):
             if not self.template_path.get():
                 messagebox.showerror("Missing", "Please select the template JSON file.")
                 return
-            if not self.spd_path.get():
-                messagebox.showerror("Missing", "Please select the Study and Patient Demographics CSV file.")
-                return
             if not self.safety_path.get():
                 messagebox.showerror("Missing", "Please select the Safety CSV file.")
                 return
@@ -370,18 +403,15 @@ class App(tk.Tk):
             self.logmsg("Loading template...")
             template_obj = read_json(self.template_path.get())
             tf = TemplateForms(template_obj)
-
-            # Log what we found so it's easy to verify against the template
-            self.logmsg(f"Prototypes found: SP&D={tf.spd_proto is not None}, "
+            self.logmsg(f"Prototypes: SP&D={tf.spd_proto is not None}, "
                         f"Safety={tf.safety_proto is not None}, "
                         f"Perf={tf.perf_discrete_proto is not None}, "
                         f"Harms={tf.harms_proto is not None}, "
                         f"Followup={tf.followup_proto is not None}")
-
             builder = JSONBuilder(tf)
 
             self.logmsg("Reading CSVs...")
-            spd_rows = read_csv(self.spd_path.get())
+            spd_rows = read_csv(self.spd_path.get()) if self.spd_path.get() else []
             safety_rows = read_csv(self.safety_path.get())
             perf_rows = read_csv(self.perf_path.get())
             harms_rows = read_csv(self.harms_path.get())
@@ -391,13 +421,12 @@ class App(tk.Tk):
                         f"Perf rows: {len(perf_rows)} | Harms rows: {len(harms_rows)} | "
                         f"Follow-up rows: {len(followup_rows)}")
 
-            # Basic validation of required ID columns
+            # Validate ID columns present where needed
             def require(cols, rows, name):
                 if rows:
                     missing = [c for c in cols if c not in rows[0].keys()]
                     if missing:
                         raise ValueError(f"{name} CSV missing column(s): {', '.join(missing)}")
-            require(("refid","spd_id"), spd_rows, "Study and Patient Demographics")
             require(("refid","spd_id"), safety_rows, "Safety")
             require(("refid","spd_id"), perf_rows, "Performance (discrete)")
             require(("safety_id",), harms_rows, "Harms")
@@ -419,3 +448,4 @@ class App(tk.Tk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+``
