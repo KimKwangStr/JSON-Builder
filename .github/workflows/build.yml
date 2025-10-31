@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pyinstaller pandas
           python -m PyInstaller --version
 
-      # Writes build_json_gui.py from the heredoc (this overrides the repo copy during CI)
+      # Writes build_json_gui.py from the heredoc (overrides repo copy during CI)
       - name: Write build_json_gui.py
         shell: bash
         run: |
@@ -327,6 +327,7 @@ def build_from_files(template_path: str,
         # 1) Clone top-level record from template_master
         top_record = _deepcopy(template_master)
         top_record["refid"] = refid
+
         # Top-level fields we KEEP as in template (tags, attachments, etc.)
         # Clear/replace 'data_sets' to a fresh structure using Extraction blueprint
         top_record["data_sets"] = {}
@@ -442,7 +443,6 @@ def build_from_files(template_path: str,
 
     logp(f"Built {len(output_records)} top-level record(s).")
     return output_records
-
 # ------------------------------------------ GUI ---------------------------------------------- #
 
 def launch_gui():
@@ -488,6 +488,7 @@ def launch_gui():
         if not out_path:
             messagebox.showerror("Error", "Choose an output JSON path")
             return
+
         try:
             txt_log.configure(state="normal")
             txt_log.delete(1.0, tk.END)
@@ -595,7 +596,6 @@ def main():
 if __name__ == "__main__":
     main()
 PYCODE
-
       - name: Preflight syntax check
         shell: bash
         run: |
@@ -614,4 +614,3 @@ PYCODE
           name: build_json_gui-exe
           path: dist/build_json_gui.exe
           if-no-files-found: error
-``
