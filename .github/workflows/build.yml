@@ -1,26 +1,16 @@
-name: Build JSON GUI EXE (V1 rollback)
+name: Minimal Heredoc Sanity Check
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
 
 jobs:
-  build-windows:
+  just-write-file:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      # ✅ Use bash heredoc to avoid YAML / PowerShell here-string pitfalls
-      - name: Create app script via heredoc (rollback to V1)
+      - name: Write Python via bash heredoc
         shell: bash
         run: |
           set -e
@@ -37,149 +27,9 @@ import json, csv, copy, tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, List, Tuple, Set
 from collections import defaultdict
-USER_NAME = "KimKwang"
-def read_json(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.loads(f.read().strip())
-def write_json(path: str, data: Any):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-def read_csv(path: str) -> List[Dict[str,str]]:
-    rows: List[Dict[str,str]] = []
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        for r in csv.DictReader(f):
-            rows.append({(k or "").strip(): (v or "").strip() for k, v in r.items()})
-    return rows
-def deep_clone(obj: Any) -> Any:
-    return json.loads(json.dumps(obj))
-class TemplateForms:
-    def __init__(self, template_obj: Any):
-        if isinstance(template_obj, list): root = template_obj[0]
-        elif isinstance(template_obj, dict): root = template_obj
-        else: raise ValueError("Unexpected template format")
-        ds_dict = root.get("data_sets", {}) or {}
-        if not ds_dict: raise ValueError("Template does not contain data_sets")
-        first_ds_key = next(iter(ds_dict.keys()))
-        self.extraction_proto = deep_clone(ds_dict[first_ds_key])
-        self.spd_proto = None
-        self.safety_proto = None
-        self.perf_discrete_proto = None
-        self.harms_proto = None
-        self.followup_proto = None
-        for _, v in (self.extraction_proto.get("child_forms", {}) or {}).items():
-            name = (v.get("form") or "").strip()
-            if name == "Study Parameters and Demographics":
-                self.spd_proto = deep_clone(v)
-            elif name == "Safety":
-                self.safety_proto = deep_clone(v)
-            elif name == "Performance (discrete)":
-                self.perf_discrete_proto = deep_clone(v)
-            elif name == "Follow-up Subform":
-                self.followup_proto = deep_clone(v)
-        if self.spd_proto:
-            for _, v in (self.spd_proto.get("child_forms", {}) or {}).items():
-                nm = (v.get("form") or "").strip()
-                if nm == "Follow-up Subform" and self.followup_proto is None:
-                    self.followup_proto = deep_clone(v)
-                if nm == "Safety" and self.safety_proto is None:
-                    self.safety_proto = deep_clone(v)
-                if nm == "Performance (discrete)" and self.perf_discrete_proto is None:
-                    self.perf_discrete_proto = deep_clone(v)
-        if self.safety_proto:
-            for _, v in (self.safety_proto.get("child_forms", {}) or {}).items():
-                if (v.get("form") or "").strip() == "Harms":
-                    self.harms_proto = deep_clone(v); break
-    def question_types(self, form_proto: Dict[str, Any]) -> Dict[str, str]:
-        out: Dict[str, str] = {}
-        for q in form_proto.get("data", []) or []:
-            out[q.get("question","")] = q.get("type","Text")
-        return out
-class JSONBuilder:
-    def __init__(self, tf: TemplateForms, logfn):
-        self.t = tf
-        self.log = logfn
-        self.next_id = 10000
-    def _gen_id(self) -> str:
-        self.next_id += 1
-        return str(self.next_id)
-    def _make_extraction(self, refid: str) -> Dict[str, Any]:
-        ds = deep_clone(self.t.extraction_proto)
-        ds["key"] = str(refid); ds["user"] = USER_NAME
-        for q in ds.get("data", []) or []:
-            if q.get("question") == "Article Identifier":
-                q.setdefault("response", {})["text"] = str(refid)
-        ds["child_forms"] = {}
-        return ds
-    def _empty_from_proto(self, form_proto: Dict[str, Any]) -> Dict[str, Any]:
-        form = deep_clone(form_proto); form["user"] = USER_NAME
-        form["data"] = [{"question": q.get("question",""),
-                         "type": q.get("type","Text"),
-                         "response":{"answer":"", "text":""}}
-                        for q in (form_proto.get("data", []) or [])]
-        form.setdefault("child_forms", {})
-        return form
-    def _populate_form_from_row(self, form_proto: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
-        form = deep_clone(form_proto); form["user"] = USER_NAME; form["data"]=[]
-        qtypes = self.t.question_types(form_proto)
-        for q_text, q_type in qtypes.items():
-            if q_text in row:
-                val = row[q_text]
-                if q_text == "Associated CERs":
-                    items = [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
-                    if not items:
-                        form["data"].append({"question": q_text, "type": q_type,
-                                             "response": {"text": "", "answer": ""}})
-                    else:
-                        for item in items:
-                            form["data"].append({"question": q_text, "type": q_type,
-                                                 "response": {"text": "", "answer": item}})
-                else:
-                    resp = {"answer":"", "text":""}
-                    if q_type in ("Radio","Checkbox"): resp["answer"] = val
-                    else: resp["text"] = val
-                    form["data"].append({"question": q_text, "type": q_type, "response": resp})
-            else:
-                form["data"].append({"question": q_text, "type": q_type,
-                                     "response":{"answer":"", "text":""}})
-        form.setdefault("child_forms", {})
-        return form
-    def _generic_form_from_row(self, form_name: str, row: Dict[str, str], *, is_subform: int, level: int = 1) -> Dict[str, Any]:
-        frm = {"form": form_name, "level": level, "is_subform": is_subform,
-               "user": USER_NAME, "key": f"{form_name.lower().replace(' ','_')}_{self._gen_id()}",
-               "data": [], "child_forms": {}}
-        for col, val in row.items():
-            if col in ("refid","spd_id","safety_id"): continue
-            frm["data"].append({"question": col, "type": "Text",
-                                "response":{"answer":"", "text": val}})
-        return frm
-    def _collect_all_pairs(self,
-                           spd_rows: List[Dict[str,str]],
-                           safety_rows: List[Dict[str,str]],
-                           perf_rows: List[Dict[str,str]],
-                           followup_rows: List[Dict[str,str]]) -> Dict[str, Set[str]]:
-        pairs: Dict[str, Set[str]] = {}
-        def add(refid: str, spd_id: str):
-            if not refid or not spd_id: return
-            pairs.setdefault(refid, set()).add(spd_id)
-        for r in spd_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in safety_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in perf_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in followup_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        return pairs
-    def build(self,
-              template_root: Dict[str, Any],
-              spd_rows: List[Dict[str, str]],
-              safety_rows: List[Dict[str, str]],
-              perf_rows: List[Dict[str, str]],
-              harms_rows: List[Dict[str, str]],
-              followup_rows: List[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-        followup_rows = followup_rows or []
-        # Grouping
-        spd_rows_by_pair: Dict[Tuple[str,str], Dict[str,str]] = {}
-        for r in spd_rows:
-            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
-            if key[0] and key[1]: spd_rows_by_pair[key] = r
-        safety_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
-        for r in safety_rows:
-            safety_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
-       
+print("Sanity check: file was written and Python starts OK.")
+PY
+
+      - name: Show first 20 lines
+        shell: bash
+        run: sed -n '1,20p' app/build_json_gui.py
