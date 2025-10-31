@@ -227,7 +227,7 @@ class JSONBuilder:
                         perf_form["user"]=USER_NAME
                     else:
                         perf_form = self._generic_form_from_row("Performance (discrete)", prow, is_subform=0, level=1)
-                    spd_form["child_forms"][self._gen_id()] = perf_form
+                    spd_form["child_forms"][perf_form["key"]] = perf_form
                     self.log(f"    + Performance (discrete) added for {pair}")
 
                 # Safety + Harms
@@ -247,9 +247,9 @@ class JSONBuilder:
                             hform["form"]="Harms"; hform["user"]=USER_NAME; hform["key"]=f"harms_{self._gen_id()}"
                         else:
                             hform = self._generic_form_from_row("Harms", hrow, is_subform=1, level=1)
-                        sform["child_forms"][self._gen_id()] = hform; harms_added += 1
+                        sform["child_forms"][hform["key"]] = hform; harms_added += 1
 
-                    spd_form["child_forms"][self._gen_id()] = sform
+                    spd_form["child_forms"][sform["key"]] = sform
                     self.log(f"    + Safety added for {pair} (harms linked={harms_added})")
 
                 # Follow-up Subform (if provided)
@@ -260,7 +260,7 @@ class JSONBuilder:
                         fu_form["user"]=USER_NAME
                     else:
                         fu_form = self._generic_form_from_row("Follow-up Subform", fu_row, is_subform=1, level=1)
-                    spd_form["child_forms"][self._gen_id()] = fu_form
+                    spd_form["child_forms"][fu_form["key"]] = fu_form
                     self.log(f"    + Follow-up Subform added for {pair}")
 
             root["data_sets"][ds_id] = extraction
