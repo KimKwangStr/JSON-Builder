@@ -1,368 +1,403 @@
-# build_json_gui.py
-# JSON builder GUI for DistillerSR-like template
-# - SP&D under Extraction.child_forms keyed as "spd_XX"
-# - Safety under SP&D; Harms under Safety linked by safety_id
-# - Performance (discrete) under SP&D
-# - Optional Follow-up Subform
-# - user = "KimKwang" everywhere
-import json, csv, copy, tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from typing import Any, Dict, List, Tuple, Set
-from collections import defaultdict
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_json_gui.py
 
-USER_NAME = "KimKwang"
+GUI + CLI tool to build a JSON output by cloning a template JSON's structure and
+populating responses from five input CSVs:
 
-def read_json(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.loads(f.read().strip())
+  1) Study and Patient Demographics.csv   (required)
+  2) Follow-up Subform.csv                (optional; used only if template contains a follow-up child form)
+  3) Safety.csv                           (required if Safety data needed)
+  4) Performance (discrete).csv           (required if Performance data needed)
+  5) Harms.csv                            (required if Harms data needed)
 
-def write_json(path: str, data: Any):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+Key behavior:
+- One top-level record is created per unique `refid` from Study and Patient Demographics.csv.
+- For each `refid`, one SPD form instance is created per unique `spd_id`. The SPD form "name"
+  is set to `spd_{XX}` (where XX is the numeric value of spd_id). Zero padding is optional.
+- Under each SPD, Safety and Performance (discrete) forms are populated from their respective CSVs.
+- Under each Safety, Harms subforms are populated from Harms.csv rows matching the same `safety_id`.
+- The existing template structure (levels, nesting, and question types) is preserved. Only responses are filled.
 
-def read_csv(path: str) -> List[Dict[str,str]]:
-    rows: List[Dict[str,str]] = []
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        for r in csv.DictReader(f):
-            rows.append({(k or "").strip(): (v or "").strip() for k, v in r.items()})
-    return rows
+CLI usage (non-GUI):
+    python build_json_gui.py \
+        --template template.json \
+        --spd "Study and Patient Demographics.csv" \
+        --safety "Safety.csv" \
+        --perf "Performance (discrete).csv" \
+        --harms "Harms.csv" \
+        --followup "Follow-up Subform.csv" \
+        --out output.json \
+        [--zero-pad-spd-id]
 
-def deep_clone(obj: Any) -> Any:
-    return json.loads(json.dumps(obj))
+To bundle as a Windows .exe (after verifying script runs):
+    pip install pyinstaller
+    pyinstaller --onefile --noconsole build_json_gui.py
 
-class TemplateForms:
-    def __init__(self, template_obj: Any):
-        if isinstance(template_obj, list): root = template_obj[0]
-        elif isinstance(template_obj, dict): root = template_obj
-        else: raise ValueError("Unexpected template format")
+Author: M365 Copilot for Kim, Kwang
+"""
 
-        ds_dict = root.get("data_sets", {}) or {}
-        if not ds_dict: raise ValueError("Template does not contain data_sets")
-        first_ds_key = next(iter(ds_dict.keys()))
-        self.extraction_proto = deep_clone(ds_dict[first_ds_key])
+from __future__ import annotations
 
-        self.spd_proto = None
-        self.safety_proto = None
-        self.perf_discrete_proto = None
-        self.harms_proto = None
-        self.followup_proto = None
+import argparse
+import copy
+import json
+import os
+import re
+import sys
+from typing import Any, Dict, List, Optional, Tuple
 
-        for _, v in (self.extraction_proto.get("child_forms", {}) or {}).items():
-            name = (v.get("form") or "").strip()
-            if name == "Study Parameters and Demographics":
-                self.spd_proto = deep_clone(v)
-            elif name == "Safety":
-                self.safety_proto = deep_clone(v)
-            elif name == "Performance (discrete)":
-                self.perf_discrete_proto = deep_clone(v)
-            elif name == "Follow-up Subform":
-                self.followup_proto = deep_clone(v)
+try:
+    import pandas as pd
+except Exception as e:
+    print("ERROR: pandas is required. Install with `pip install pandas`.", file=sys.stderr)
+    raise
 
-        if self.spd_proto:
-            for _, v in (self.spd_proto.get("child_forms", {}) or {}).items():
-                nm = (v.get("form") or "").strip()
-                if nm == "Follow-up Subform" and self.followup_proto is None:
-                    self.followup_proto = deep_clone(v)
-                if nm == "Safety" and self.safety_proto is None:
-                    self.safety_proto = deep_clone(v)
-                if nm == "Performance (discrete)" and self.perf_discrete_proto is None:
-                    self.perf_discrete_proto = deep_clone(v)
+# ------------------------ Utility: normalized question header matching ------------------------ #
 
-        if self.safety_proto:
-            for _, v in (self.safety_proto.get("child_forms", {}) or {}).items():
-                if (v.get("form") or "").strip() == "Harms":
-                    self.harms_proto = deep_clone(v); break
+def _normalize(s: str) -> str:
+    """Normalize strings for fuzzy question <-> column matching."""
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.strip().lower()
+    # unify some common symbols/spaces
+    s = re.sub(r"\s+", " ", s)
+    # remove surrounding quotes and extra punctuation
+    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    s = re.sub(r"[^\w%()/?\-\s\.]", "", s)
+    s = s.replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-    def question_types(self, form_proto: Dict[str, Any]) -> Dict[str, str]:
-        out: Dict[str, str] = {}
-        for q in form_proto.get("data", []) or []:
-            out[q.get("question","")] = q.get("type","Text")
-        return out
+def _index_by_normalized(headers: List[str]) -> Dict[str, str]:
+    """Map normalized header -> original header for quick lookup."""
+    return {_normalize(h): h for h in headers}
 
-class JSONBuilder:
-    def __init__(self, tf: TemplateForms, logfn):
-        self.t = tf
-        self.log = logfn
-        self.next_id = 10000
+# ----------------------------- Template scanning / cloning helpers ---------------------------- #
 
-    def _gen_id(self) -> str:
-        self.next_id += 1
-        return str(self.next_id)
-
-    def _make_extraction(self, refid: str) -> Dict[str, Any]:
-        ds = deep_clone(self.t.extraction_proto)
-        ds["key"] = str(refid); ds["user"] = USER_NAME
-        for q in ds.get("data", []) or []:
-            if q.get("question") == "Article Identifier":
-                q.setdefault("response", {})["text"] = str(refid)
-        ds["child_forms"] = {}
-        return ds
-
-    def _empty_from_proto(self, form_proto: Dict[str, Any]) -> Dict[str, Any]:
-        form = deep_clone(form_proto); form["user"] = USER_NAME
-        form["data"] = [{"question": q.get("question",""),
-                         "type": q.get("type","Text"),
-                         "response":{"answer":"", "text":""}}
-                        for q in (form_proto.get("data", []) or [])]
-        form.setdefault("child_forms", {})
-        return form
-
-    def _populate_form_from_row(self, form_proto: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
-        form = deep_clone(form_proto); form["user"] = USER_NAME; form["data"]=[]
-        qtypes = self.t.question_types(form_proto)
-        for q_text, q_type in qtypes.items():
-            if q_text in row:
-                val = row[q_text]
-                if q_text == "Associated CERs":
-                    items = [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
-                    if not items:
-                        form["data"].append({"question": q_text, "type": q_type,
-                                             "response": {"text": "", "answer": ""}})
-                    else:
-                        for item in items:
-                            form["data"].append({"question": q_text, "type": q_type,
-                                                 "response": {"text": "", "answer": item}})
-                else:
-                    resp = {"answer":"", "text":""}
-                    if q_type in ("Radio","Checkbox"): resp["answer"] = val
-                    else: resp["text"] = val
-                    form["data"].append({"question": q_text, "type": q_type, "response": resp})
-            else:
-                form["data"].append({"question": q_text, "type": q_type,
-                                     "response":{"answer":"", "text":""}})
-        form.setdefault("child_forms", {})
-        return form
-
-    def _generic_form_from_row(self, form_name: str, row: Dict[str, str], *,
-                               is_subform: int, level: int = 1) -> Dict[str, Any]:
-        frm = {"form": form_name, "level": level, "is_subform": is_subform,
-               "user": USER_NAME, "key": f"{form_name.lower().replace(' ','_')}_{self._gen_id()}",
-               "data": [], "child_forms": {}}
-        for col, val in row.items():
-            if col in ("refid","spd_id","safety_id"): continue
-            frm["data"].append({"question": col, "type": "Text",
-                                "response":{"answer":"", "text": val}})
-        return frm
-    def _collect_all_pairs(self,
-                           spd_rows: List[Dict[str,str]],
-                           safety_rows: List[Dict[str,str]],
-                           perf_rows: List[Dict[str,str]],
-                           followup_rows: List[Dict[str,str]]) -> Dict[str, Set[str]]:
-        pairs: Dict[str, Set[str]] = {}
-        def add(refid: str, spd_id: str):
-            if not refid or not spd_id: return
-            pairs.setdefault(refid, set()).add(spd_id)
-        for r in spd_rows:      add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in safety_rows:   add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in perf_rows:     add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        for r in followup_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
-        return pairs
-
-    def build(self,
-              template_root: Dict[str, Any],
-              spd_rows: List[Dict[str, str]],
-              safety_rows: List[Dict[str, str]],
-              perf_rows: List[Dict[str, str]],
-              harms_rows: List[Dict[str, str]],
-              followup_rows: List[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-        followup_rows = followup_rows or []
-
-        # Grouping
-        spd_rows_by_pair: Dict[Tuple[str,str], Dict[str,str]] = {}
-        for r in spd_rows:
-            key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
-            if key[0] and key[1]: spd_rows_by_pair[key] = r
-
-        safety_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
-        for r in safety_rows:
-            safety_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
-
-        harms_by_safety_id: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-        for r in harms_rows:
-            sid = (r.get("safety_id") or "").strip()
-            if sid: harms_by_safety_id[sid].append(r)
-
-        perf_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
-        for r in perf_rows:
-            perf_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
-
-        followup_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
-        for r in (followup_rows or []):
-            followup_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
-
-        # Anchors from ALL CSVs so Safety/Perf create parents when needed
-        pairs_by_refid = self._collect_all_pairs(spd_rows, safety_rows, perf_rows, followup_rows)
-
-        out: List[Dict[str, Any]] = []
-        for refid, spd_ids in pairs_by_refid.items():
-            root = {"refid": int(refid) if refid.isdigit() else refid,
-                    "tags": [], "attachments": [], "biblio_string": "", "data_sets": {}}
-            ds_id = self._gen_id()
-            extraction = self._make_extraction(refid)
-            extraction["child_forms"] = {}
-
-            self.log(f"REFID {refid}: building {len(spd_ids)} SP&D form(s)")
-            for spd_id in sorted(spd_ids, key=lambda x: (len(x), x)):
-                pair = (refid, spd_id)
-                self.log(f"  SP&D spd_{spd_id}: Safety={len(safety_by_pair.get(pair,[]))}, "
-                         f"Perf={len(perf_by_pair.get(pair,[]))}, "
-                         f"Follow-up={len(followup_by_pair.get(pair,[]))}")
-
-                # SP&D (from CSV if present, else empty-from-proto)
-                if self.t.spd_proto is None:
-                    raise ValueError("Template missing Study Parameters and Demographics prototype.")
-                if pair in spd_rows_by_pair:
-                    spd_form = self._populate_form_from_row(self.t.spd_proto, spd_rows_by_pair[pair])
-                else:
-                    spd_form = self._empty_from_proto(self.t.spd_proto)
-                spd_form["key"] = f"spd_{spd_id}"; spd_form["form"]="Study Parameters and Demographics"
-                spd_form["user"] = USER_NAME; spd_form["child_forms"] = {}
-                extraction["child_forms"][f"spd_{spd_id}"] = spd_form
-
-                # Performance (discrete)
-                for prow in perf_by_pair.get(pair, []):
-                    if self.t.perf_discrete_proto is not None:
-                        perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, prow)
-                        perf_form["key"]=f"perf_{self._gen_id()}"; perf_form["form"]="Performance (discrete)"
-                        perf_form["user"]=USER_NAME
-                    else:
-                        perf_form = self._generic_form_from_row("Performance (discrete)", prow, is_subform=0, level=1)
-                    spd_form["child_forms"][perf_form["key"]] = perf_form
-                    self.log(f"    + Performance (discrete) added for {pair}")
-
-                # Safety + Harms
-                for srow in safety_by_pair.get(pair, []):
-                    sid = (srow.get("safety_id") or "").strip()
-                    if self.t.safety_proto is not None:
-                        sform = self._populate_form_from_row(self.t.safety_proto, srow)
-                        sform["form"]="Safety"; sform["user"]=USER_NAME
-                        sform["key"]=f"safety_{sid or self._gen_id()}"; sform["child_forms"]={}
-                    else:
-                        sform = self._generic_form_from_row("Safety", srow, is_subform=0, level=1)
-
-                    harms_added = 0
-                    for hrow in harms_by_safety_id.get(sid, []):
-                        if self.t.harms_proto is not None:
-                            hform = self._populate_form_from_row(self.t.harms_proto, hrow)
-                            hform["form"]="Harms"; hform["user"]=USER_NAME; hform["key"]=f"harms_{self._gen_id()}"
-                        else:
-                            hform = self._generic_form_from_row("Harms", hrow, is_subform=1, level=1)
-                        sform["child_forms"][hform["key"]] = hform; harms_added += 1
-
-                    spd_form["child_forms"][sform["key"]] = sform
-                    self.log(f"    + Safety added for {pair} (harms linked={harms_added})")
-
-                # Follow-up Subform (if provided)
-                for fu_row in followup_by_pair.get(pair, []):
-                    if self.t.followup_proto is not None:
-                        fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
-                        fu_form["form"]="Follow-up Subform"; fu_form["key"]=fu_form.get("key", f"followup_{self._gen_id()}")
-                        fu_form["user"]=USER_NAME
-                    else:
-                        fu_form = self._generic_form_from_row("Follow-up Subform", fu_row, is_subform=1, level=1)
-                    spd_form["child_forms"][fu_form["key"]] = fu_form
-                    self.log(f"    + Follow-up Subform added for {pair}")
-
-            root["data_sets"][ds_id] = extraction
-            out.append(root)
-
-        return out
-
-class App(tk.Tk):
+class TemplatePaths:
+    """Holds discovered paths to key template forms."""
     def __init__(self):
-        super().__init__()
-        self.title("JSON Builder from CSVs")
-        self.geometry("860x600")
-        self.template_path = tk.StringVar()
-        self.spd_path = tk.StringVar()
-        self.safety_path = tk.StringVar()
-        self.perf_path = tk.StringVar()
-        self.harms_path = tk.StringVar()
-        self.followup_path = tk.StringVar()
-        self.out_path = tk.StringVar()
-        self._build_ui()
+        self.extraction_id: Optional[str] = None
+        self.spd_id: Optional[str] = None
+        self.safety_id_under_spd: Optional[str] = None
+        self.perf_id_under_spd: Optional[str] = None
+        self.followup_id_under_spd: Optional[str] = None  # optional
+        self.harms_id_under_safety: Optional[str] = None
 
-    def _row(self, r, label, var, filetypes):
-        tk.Label(self, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=6)
-        tk.Entry(self, textvariable=var, width=88).grid(row=r, column=1, padx=10)
-        def browse():
-            p = filedialog.askopenfilename(filetypes=filetypes)
-            if p: var.set(p)
-        tk.Button(self, text="Browse...", command=browse).grid(row=r, column=2, padx=8)
+class IdFactory:
+    """Generates new integer-like string IDs following the maximum found in the template."""
+    def __init__(self, start_from: int):
+        self.counter = start_from
 
-    def _build_ui(self):
-        self._row(0, "Template JSON:", self.template_path, [("JSON","*.json")])
-        ttk.Separator(self, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
-        self._row(2, "Study and Patient Demographics CSV (optional):", self.spd_path, [("CSV","*.csv")])
-        self._row(3, "Follow-up Subform CSV (optional):", self.followup_path, [("CSV","*.csv")])
-        self._row(4, "Safety CSV:", self.safety_path, [("CSV","*.csv")])
-        self._row(5, "Performance (discrete) CSV:", self.perf_path, [("CSV","*.csv")])
-        self._row(6, "Harms CSV:", self.harms_path, [("CSV","*.csv")])
-        ttk.Separator(self, orient="horizontal").grid(row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
-        self._row(8, "Output JSON:", self.out_path, [("JSON","*.json")])
-        def choose_out():
-            p = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON","*.json")])
-            if p: self.out_path.set(p)
-        tk.Button(self, text="Save As...", command=choose_out).grid(row=8, column=2, padx=8)
+    def next(self) -> str:
+        self.counter += 1
+        return str(self.counter)
 
-        self.log = tk.Text(self, height=16)
-        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew", padx=10, pady=8)
-        self.grid_rowconfigure(9, weight=1); self.grid_columnconfigure(1, weight=1)
-        tk.Button(self, text="Build JSON", command=self.on_build).grid(row=10, column=2, sticky="e", padx=8, pady=10)
+def _collect_all_numeric_keys(obj: Any, keys: Optional[List[int]] = None) -> List[int]:
+    if keys is None:
+        keys = []
+    if isinstance(obj, dict):
+        # If this dict is one of the keyed "data_sets"/"child_forms", its keys are stringified integers
+        for k, v in obj.items():
+            if isinstance(k, str) and k.isdigit():
+                keys.append(int(k))
+            _collect_all_numeric_keys(v, keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_all_numeric_keys(item, keys)
+    return keys
 
-    def logmsg(self, msg: str):
-        try:
-            self.log.insert("end", str(msg)); self.log.insert("end", "\n")
-            self.log.see("end"); self.update_idletasks()
-        except Exception:
-            pass
+def _find_form_id_by_name(forms_dict: Dict[str, Any], contains_terms: Tuple[str, ...]) -> Optional[str]:
+    """Find a form id in forms_dict where form name contains all terms (case-insensitive)."""
+    for fid, node in forms_dict.items():
+        name = str(node.get("form", ""))
+        norm = _normalize(name)
+        if all(term in norm for term in contains_terms):
+            return fid
+    return None
 
-    def on_build(self):
-        try:
-            if not self.template_path.get(): messagebox.showerror("Missing", "Please select the template JSON file."); return
-            if not self.safety_path.get():   messagebox.showerror("Missing", "Please select the Safety CSV file."); return
-            if not self.perf_path.get():     messagebox.showerror("Missing", "Please select the Performance (discrete) CSV file."); return
-            if not self.harms_path.get():    messagebox.showerror("Missing", "Please select the Harms CSV file."); return
-            if not self.out_path.get():      messagebox.showerror("Missing", "Please choose an output JSON path."); return
+def _deepcopy(node: Any) -> Any:
+    return copy.deepcopy(node)
 
-            self.logmsg("Loading template...")
-            template_obj = read_json(self.template_path.get())
-            tf = TemplateForms(template_obj)
-            self.logmsg(f"Prototypes: SP&D={tf.spd_proto is not None}, Safety={tf.safety_proto is not None}, "
-                        f"Perf={tf.perf_discrete_proto is not None}, Harms={tf.harms_proto is not None}, "
-                        f"Followup={tf.followup_proto is not None}")
+def _set_response(datum: Dict[str, Any], value: Any) -> None:
+    """Set response field according to datum['type'] following the template conventions."""
+    dtype = str(datum.get("type", "")).strip().lower()
+    resp = datum.get("response", {})
+    # Ensure structure
+    if not isinstance(resp, dict):
+        resp = {}
+        datum["response"] = resp
 
-            builder = JSONBuilder(tf, self.logmsg)
+    if dtype == "text":
+        # store in 'text'
+        resp["text"] = "" if value is None else str(value)
+        # keep 'answer' if template includes it (but normally blank)
+        resp.setdefault("answer", "")
+    elif dtype in ("radio", "checkbox"):
+        # store in 'answer'
+        resp["answer"] = "" if value is None else str(value)
+        resp.setdefault("text", "")
+    else:
+        # Unknown type: set both defensively
+        resp["text"] = "" if value is None else str(value)
+        resp["answer"] = "" if value is None else str(value)
 
-            self.logmsg("Reading CSVs...")
-            spd_rows = read_csv(self.spd_path.get()) if self.spd_path.get() else []
-            safety_rows = read_csv(self.safety_path.get())
-            perf_rows = read_csv(self.perf_path.get())
-            harms_rows = read_csv(self.harms_path.get())
-            followup_rows = read_csv(self.followup_path.get()) if self.followup_path.get() else []
+def _populate_form_data_from_row(form_node: Dict[str, Any],
+                                 row: pd.Series,
+                                 header_index: Dict[str, str],
+                                 spd_label_override: Optional[str] = None) -> None:
+    """
+    For each 'data' question in form_node, try to find a matching CSV column by question text.
+    If found, set response. If not found, leave as in template. Optionally override 'Dataset Label'.
+    """
+    for datum in form_node.get("data", []):
+        q_text = str(datum.get("question", ""))
+        norm_q = _normalize(q_text)
+        value = None
 
-            self.logmsg(f"Row counts → SPD:{len(spd_rows)} Safety:{len(safety_rows)} "
-                        f"Perf:{len(perf_rows)} Harms:{len(harms_rows)} Follow-up:{len(followup_rows)}")
+        # Allow special override for dataset label (SPD name)
+        if spd_label_override and norm_q in {_normalize("Dataset Label"), _normalize("Form Name")}:
+            value = spd_label_override
+        else:
+            # direct header name match
+            if norm_q in header_index:
+                col = header_index[norm_q]
+                if col in row.index:
+                    value = row[col]
 
-            # Validate IDs
-            def require(cols, rows, name):
-                if rows:
-                    missing = [c for c in cols if c not in rows[0].keys()]
-                    if missing: raise ValueError(f"{name} CSV missing column(s): {', '.join(missing)}")
-            require(("refid","spd_id"), safety_rows, "Safety")
-            require(("refid","spd_id"), perf_rows, "Performance (discrete)")
-            require(("safety_id",), harms_rows, "Harms")
+        _set_response(datum, value)
 
-            self.logmsg("Building JSON...")
-            out_list = builder.build(template_obj, spd_rows, safety_rows, perf_rows, harms_rows, followup_rows)
+# ------------------------ Core builder: from template + csvs to output JSON ------------------- #
 
-            self.logmsg("Writing output...")
-            write_json(self.out_path.get(), out_list)
-            messagebox.showinfo("Success", "JSON built successfully and saved to:\n" + str(self.out_path.get()))
-        except Exception as e:
-            messagebox.showerror("Error", str(e)); self.logmsg(f"ERROR: {e}")
+def build_from_files(template_path: str,
+                     spd_path: str,
+                     safety_path: Optional[str],
+                     perf_path: Optional[str],
+                     harms_path: Optional[str],
+                     followup_path: Optional[str],
+                     zero_pad_spd: bool = False,
+                     log: Optional[callable] = None) -> List[Dict[str, Any]]:
 
-if __name__ == "__main__":
-    app = App()
-    app.mainloop()
-``
+    def logp(msg: str):
+        if log:
+            log(msg)
+
+    # Load template JSON (must be a list with at least one object)
+    with open(template_path, "r", encoding="utf-8") as f:
+        template_json = json.load(f)
+
+    if not isinstance(template_json, list) or not template_json:
+        raise ValueError("Template must be a JSON array with at least 1 record.")
+
+    template_master = template_json[0]
+
+    # Discover the template structure: Extraction -> SPD -> Safety/Performance/Followup; Safety -> Harms
+    ds_dict = template_master.get("data_sets", {})
+    if not isinstance(ds_dict, dict) or not ds_dict:
+        raise ValueError("Template missing 'data_sets' dictionary with at least one dataset.")
+
+    # Identify the top-level 'Extraction' dataset (by name)
+    extraction_id = _find_form_id_by_name(ds_dict, ("extraction",))
+    if extraction_id is None:
+        raise ValueError("Could not find an 'Extraction' dataset in template (form name contains 'Extraction').")
+
+    extraction_template = ds_dict[extraction_id]
+    extraction_children = extraction_template.get("child_forms", {}) or {}
+
+    # Identify the SPD form (Study ... Demographics)
+    spd_id = _find_form_id_by_name(extraction_children, ("study", "demographics"))
+    if spd_id is None:
+        raise ValueError("Could not find a 'Study and Patient Demographics' form under Extraction "
+                         "(form name should contain 'Study' and 'Demographics').")
+
+    spd_template = extraction_children[spd_id]
+    spd_children = spd_template.get("child_forms", {}) or {}
+
+    # Under SPD, find Safety & Performance (discrete); Follow-up is optional
+    safety_id_under_spd = _find_form_id_by_name(spd_children, ("safety",))
+    perf_id_under_spd = _find_form_id_by_name(spd_children, ("performance", "discrete"))
+    followup_id_under_spd = _find_form_id_by_name(spd_children, ("follow",))  # optional
+
+    harms_id_under_safety = None
+    safety_template = spd_children.get(safety_id_under_spd, {}) if safety_id_under_spd else {}
+    safety_children = safety_template.get("child_forms", {}) or {}
+    if safety_children:
+        harms_id_under_safety = _find_form_id_by_name(safety_children, ("harms",))
+
+    # Gather max numeric key to continue IDs
+    all_numeric_keys = _collect_all_numeric_keys(template_master)
+    start_from = max(all_numeric_keys) if all_numeric_keys else 10000
+    id_factory = IdFactory(start_from=start_from)
+
+    # Read CSVs
+    spd_df = pd.read_csv(spd_path, dtype=str).fillna("")
+    logp(f"Loaded SPD rows: {len(spd_df)}")
+
+    safety_df = pd.read_csv(safety_path, dtype=str).fillna("") if safety_path and os.path.exists(safety_path) else None
+    if safety_df is not None:
+        logp(f"Loaded Safety rows: {len(safety_df)}")
+
+    perf_df = pd.read_csv(perf_path, dtype=str).fillna("") if perf_path and os.path.exists(perf_path) else None
+    if perf_df is not None:
+        logp(f"Loaded Performance (discrete) rows: {len(perf_df)}")
+
+    harms_df = pd.read_csv(harms_path, dtype=str).fillna("") if harms_path and os.path.exists(harms_path) else None
+    if harms_df is not None:
+        logp(f"Loaded Harms rows: {len(harms_df)}")
+
+    followup_df = pd.read_csv(followup_path, dtype=str).fillna("") if followup_path and os.path.exists(followup_path) else None
+    if followup_df is not None:
+        logp(f"Loaded Follow-up rows: {len(followup_df)}")
+
+    # Build indices for matching
+    spd_hdr_idx = _index_by_normalized(list(spd_df.columns))
+    safety_hdr_idx = _index_by_normalized(list(safety_df.columns)) if safety_df is not None else {}
+    perf_hdr_idx = _index_by_normalized(list(perf_df.columns)) if perf_df is not None else {}
+    harms_hdr_idx = _index_by_normalized(list(harms_df.columns)) if harms_df is not None else {}
+    followup_hdr_idx = _index_by_normalized(list(followup_df.columns)) if followup_df is not None else {}
+
+    # Group DataFrames for quick access
+    def group_df(df: pd.DataFrame, keys: List[str]) -> Dict[Tuple[str, ...], pd.DataFrame]:
+        if df is None:
+            return {}
+        for k in keys:
+            if k not in df.columns:
+                raise ValueError(f"Required column '{k}' missing in CSV.")
+        grouped = {}
+        for key_vals, sub in df.groupby(keys, dropna=False, sort=False):
+            if not isinstance(key_vals, tuple):
+                key_vals = (key_vals,)
+            grouped[tuple(str(k) for k in key_vals)] = sub
+        return grouped
+
+    spd_by_refid = group_df(spd_df, ["refid"])
+    safety_by_refid_spd = group_df(safety_df, ["refid", "spd_id"]) if safety_df is not None else {}
+    perf_by_refid_spd = group_df(perf_df, ["refid", "spd_id"]) if perf_df is not None else {}
+    harms_by_refid_spd_safety = group_df(harms_df, ["refid", "spd_id", "safety_id"]) if harms_df is not None else {}
+    follow_by_refid_spd = group_df(followup_df, ["refid", "spd_id"]) if followup_df is not None else {}
+
+    # Start constructing output list (one top-level record per refid)
+    output_records: List[Dict[str, Any]] = []
+
+    for (refid_key, spd_rows_for_refid) in spd_by_refid.items():
+        refid = refid_key[0]
+
+        # 1) Clone top-level record from template_master
+        top_record = _deepcopy(template_master)
+        top_record["refid"] = refid
+
+        # Top-level fields we KEEP as in template (tags, attachments, etc.)
+        # Clear/replace 'data_sets' to a fresh structure using Extraction blueprint
+        top_record["data_sets"] = {}
+
+        # 2) Create a fresh Extraction dataset node
+        new_extraction_id = id_factory.next()
+        extraction_node = _deepcopy(extraction_template)
+        extraction_node["key"] = str(refid)  # In template this is text of Article Identifier; we reuse as key
+        extraction_node["child_forms"] = {}  # we will populate fresh SPD instances under it
+
+        # Also update Article Identifier question inside Extraction (if present)
+        for datum in extraction_node.get("data", []):
+            if _normalize(datum.get("question", "")) == _normalize("Article Identifier"):
+                _set_response(datum, refid)
+
+        top_record["data_sets"][new_extraction_id] = extraction_node
+
+        # 3) For each unique spd_id under this refid, create an SPD form instance
+        if "spd_id" not in spd_rows_for_refid.columns:
+            raise ValueError("SPD CSV must contain 'spd_id' column.")
+
+        # Ensure deterministic order by spd_id as int if possible
+        spd_rows_for_refid["__spd_id_sort__"] = spd_rows_for_refid["spd_id"].apply(lambda v: int(v) if str(v).isdigit() else v)
+        spd_rows_for_refid = spd_rows_for_refid.sort_values("__spd_id_sort__", kind="stable")
+
+        extraction_children = extraction_node["child_forms"]
+        for _, spd_row in spd_rows_for_refid.iterrows():
+            spd_id_val = spd_row["spd_id"]
+            # SPD name spd_XX (optionally zero-padded)
+            try:
+                n = int(str(spd_id_val).strip())
+                spd_name = f"spd_{n:02d}" if zero_pad_spd else f"spd_{n}"
+            except Exception:
+                spd_name = f"spd_{spd_id_val}"
+
+            # Clone SPD template
+            new_spd_id = id_factory.next()
+            spd_node = _deepcopy(spd_template)
+            spd_node["key"] = spd_name
+
+            # Fill SPD data by matching question texts to columns
+            _populate_form_data_from_row(spd_node, spd_row, spd_hdr_idx, spd_label_override=spd_name)
+
+            # Prepare SPD child_forms container
+            spd_node["child_forms"] = {}
+            extraction_children[new_spd_id] = spd_node
+
+            # 3a) SAFETY under this SPD
+            if safety_id_under_spd and (refid, spd_id_val) in safety_by_refid_spd:
+                safety_template_node = _deepcopy(safety_template)
+                # We'll use the template only as a blueprint; we will create one safety node per unique safety_id
+                safety_rows = safety_by_refid_spd[(refid, spd_id_val)]
+                if "safety_id" not in safety_rows.columns:
+                    raise ValueError("Safety.csv must contain 'safety_id' column.")
+
+                for _, srow in safety_rows.iterrows():
+                    safety_id_val = srow["safety_id"]
+                    new_safety_id = id_factory.next()
+                    safety_node = _deepcopy(safety_template_node)
+                    # Construct a readable key (does not change JSON structure)
+                    ae_val = srow.get("Adverse Event", "") or srow.get("adverse_event", "")
+                    safety_node["key"] = f"{spd_name}\n{ae_val}".strip()
+
+                    # Fill Safety data
+                    _populate_form_data_from_row(safety_node, srow, safety_hdr_idx)
+
+                    # Ensure child_forms exists
+                    safety_node["child_forms"] = {}
+
+                    # 3a-i) HARMS under this Safety (match by safety_id)
+                    if harms_id_under_safety and (refid, spd_id_val, safety_id_val) in harms_by_refid_spd_safety:
+                        harms_template_node = _deepcopy(safety_children.get(harms_id_under_safety, {}))
+                        harms_rows = harms_by_refid_spd_safety[(refid, spd_id_val, safety_id_val)]
+                        for _, hrow in harms_rows.iterrows():
+                            new_harm_id = id_factory.next()
+                            harm_node = _deepcopy(harms_template_node)
+                            # key can be composed from context; keep concise
+                            harm_node["key"] = f"{spd_name}\n{safety_id_val}".strip()
+                            _populate_form_data_from_row(harm_node, hrow, harms_hdr_idx)
+                            # Attach harm_node under this safety
+                            safety_node["child_forms"][new_harm_id] = harm_node
+
+                    # Attach safety_node under SPD
+                    spd_node["child_forms"][new_safety_id] = safety_node
+
+            # 3b) PERFORMANCE (discrete) under this SPD
+            if perf_id_under_spd and (refid, spd_id_val) in perf_by_refid_spd:
+                perf_template_node = _deepcopy(spd_children.get(perf_id_under_spd, {}))
+                perf_rows = perf_by_refid_spd[(refid, spd_id_val)]
+                for _, prow in perf_rows.iterrows():
+                    new_perf_id = id_factory.next()
+                    perf_node = _deepcopy(perf_template_node)
+                    # key for perf can include endpoint and time point if present
+                    endpoint = prow.get("Perf Discrete Endpoint", "") or prow.get("perf discrete endpoint", "")
+                    tpoint = prow.get("Perf Discrete Time Point", "") or prow.get("perf discrete time point", "")
+                    perf_node["key"] = f"{spd_name}\n{endpoint}-{tpoint}".strip("-").strip()
+                    _populate_form_data_from_row(perf_node, prow, perf_hdr_idx)
+                    spd_node["child_forms"][new_perf_id] = perf_node
+
+            # 3c) FOLLOW-UP under this SPD (optional)
+            if followup_id_under_spd and (refid, spd_id_val) in follow_by_refid_spd:
+                follow_template_node = _deepcopy(spd_children.get(followup_id_under_spd, {}))
+                follow_rows = follow_by_refid_spd[(refid, spd_id_val)]
+                for _, frow in follow_rows.iterrows():
+                    new_follow_id = id_factory.next()
+                    follow_node = _deepcopy(follow_template_node)
+                    # Build a simple key
+                    follow_node["key"] = f"{spd_name}\nFollow-up"
+                    _populate_form_data_from_row(follow_node, frow, followup_hdr_idx)
+                    spd_node["child_forms"][new_follow_id] = follow_node
+
+       
