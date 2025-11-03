@@ -32,23 +32,22 @@ jobs:
           python -m pip install --upgrade pyinstaller
           python -m PyInstaller --version
 
-      # Write build_json_gui.py via bash heredoc
+      # Write build_json_gui.py via bash heredoc (ONLY the Python below changed to implement your key formats)
       - name: Write build_json_gui.py
         shell: bash
         run: |
           cat > build_json_gui.py << 'PYCODE'
           # build_json_gui.py
           # JSON builder GUI for DistillerSR-like template
-          # - SP&D under Extraction.child_forms keyed as "spd_XX"
-          # - Safety under SP&D; Harms under Safety linked by safety_id
-          # - Performance (discrete) under SP&D
-          # - Optional Follow-up Subform
+          # - SP&D under Extraction.child_forms keyed as "refid|spd_XX"
+          # - Safety under SP&D; key "refid|spd_XX|<Adverse Event>"
+          # - Performance (discrete) under SP&D; key "refid|spd_XX|<Perf Discrete Endpoint>"
+          # - Optional Follow-up Subform (unchanged)
           # - user = "KimKwang" everywhere
           import json, csv, copy, tkinter as tk
           from tkinter import filedialog, messagebox, ttk
           from typing import Any, Dict, List, Tuple, Set
           from collections import defaultdict
-
           USER_NAME = "KimKwang"
 
           def read_json(path: str):
@@ -68,6 +67,15 @@ jobs:
 
           def deep_clone(obj: Any) -> Any:
               return json.loads(json.dumps(obj))
+
+          def pad2(x: str) -> str:
+              try:
+                  return f"{int(str(x)) :02d}"
+              except Exception:
+                  return str(x)
+
+          def join_key(parts: List[str]) -> str:
+              return "|".join([p for p in parts if p is not None and p != ""])
 
           class TemplateForms:
               def __init__(self, template_obj: Any):
@@ -112,6 +120,7 @@ jobs:
                       for _, v in (self.safety_proto.get("child_forms", {}) or {}).items():
                           if (v.get("form") or "").strip() == "Harms":
                               self.harms_proto = deep_clone(v); break
+
               def question_types(self, form_proto: Dict[str, Any]) -> Dict[str, str]:
                   out: Dict[str, str] = {}
                   for q in form_proto.get("data", []) or []:
@@ -234,20 +243,20 @@ jobs:
 
                   out: List[Dict[str, Any]] = []
                   for refid, spd_ids in pairs_by_refid.items():
-                      root = {"refid": int(refid) if refid.isdigit() else refid,
+                      refid_str = str(refid)
+                      root = {"refid": int(refid) if str(refid).isdigit() else refid,
                               "tags": [], "attachments": [], "biblio_string": "", "data_sets": {}}
                       ds_id = self._gen_id()
-                      extraction = self._make_extraction(refid)
+                      extraction = self._make_extraction(refid_str)
                       extraction["child_forms"] = {}
 
                       self.log(f"REFID {refid}: building {len(spd_ids)} SP&D form(s)")
                       for spd_id in sorted(spd_ids, key=lambda x: (len(x), x)):
+                          spd_disp = f"spd_{pad2(spd_id)}"
+                          spd_key = join_key([refid_str, spd_disp])                 # ==> refid|spd_XX
                           pair = (refid, spd_id)
-                          self.log(f"  SP&D spd_{spd_id}: Safety={len(safety_by_pair.get(pair,[]))}, "
-                                   f"Perf={len(perf_by_pair.get(pair,[]))}, "
-                                   f"Follow-up={len(followup_by_pair.get(pair,[]))}")
 
-                          # SP&D (from CSV if present, else empty-from-proto)
+                          # SP&D form (from CSV if present, else empty-from-proto)
                           if self.t.spd_proto is None:
                               raise ValueError("Template missing Study Parameters and Demographics prototype.")
                           if pair in spd_rows_by_pair:
@@ -255,36 +264,42 @@ jobs:
                           else:
                               spd_form = self._empty_from_proto(self.t.spd_proto)
 
-                          spd_form["key"] = f"spd_{spd_id}"
+                          spd_form["key"] = spd_key
                           spd_form["form"] = "Study Parameters and Demographics"
                           spd_form["user"] = USER_NAME
                           spd_form["child_forms"] = {}
-                          extraction["child_forms"][f"spd_{spd_id}"] = spd_form
+                          extraction["child_forms"][spd_key] = spd_form
 
-                          # Performance (discrete)
+                          # Performance (discrete) forms
                           for prow in perf_by_pair.get(pair, []):
+                              endpoint = (prow.get("Perf Discrete Endpoint") or "").strip()
+                              perf_key = join_key([refid_str, spd_disp, endpoint])   # ==> refid|spd_XX|<endpoint>
                               if self.t.perf_discrete_proto is not None:
                                   perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, prow)
-                                  perf_form["key"] = f"perf_{self._gen_id()}"
+                                  perf_form["key"] = perf_key
                                   perf_form["form"] = "Performance (discrete)"
                                   perf_form["user"] = USER_NAME
                               else:
                                   perf_form = self._generic_form_from_row("Performance (discrete)", prow, is_subform=0, level=1)
-
-                              spd_form["child_forms"][perf_form["key"]] = perf_form
-                              self.log(f"    + Performance (discrete) added for {pair}")
+                                  perf_form["key"] = perf_key
+                              spd_form["child_forms"][perf_key] = perf_form
+                              self.log(f"    + Performance (discrete) added for {pair} -> {perf_key}")
 
                           # Safety + Harms
                           for srow in safety_by_pair.get(pair, []):
                               sid = (srow.get("safety_id") or "").strip()
+                              adverse = (srow.get("Adverse Event") or "").strip()
+                              safety_key = join_key([refid_str, spd_disp, adverse])  # ==> refid|spd_XX|<Adverse Event>
+
                               if self.t.safety_proto is not None:
                                   sform = self._populate_form_from_row(self.t.safety_proto, srow)
                                   sform["form"] = "Safety"
                                   sform["user"] = USER_NAME
-                                  sform["key"] = f"safety_{sid or self._gen_id()}"
+                                  sform["key"] = safety_key
                                   sform["child_forms"] = {}
                               else:
                                   sform = self._generic_form_from_row("Safety", srow, is_subform=0, level=1)
+                                  sform["key"] = safety_key
 
                               harms_added = 0
                               for hrow in harms_by_safety_id.get(sid, []):
@@ -298,10 +313,10 @@ jobs:
                                   sform["child_forms"][hform["key"]] = hform
                                   harms_added += 1
 
-                              spd_form["child_forms"][sform["key"]] = sform
-                              self.log(f"    + Safety added for {pair} (harms linked={harms_added})")
+                              spd_form["child_forms"][safety_key] = sform
+                              self.log(f"    + Safety added for {pair} -> {safety_key} (harms linked={harms_added})")
 
-                          # Follow-up Subform (if provided)
+                          # Follow-up Subform (unchanged)
                           for fu_row in followup_by_pair.get(pair, []):
                               if self.t.followup_proto is not None:
                                   fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
