@@ -1,37 +1,39 @@
 name: Build Windows EXE (Heredoc)
+
 on:
   workflow_dispatch:
   push:
     paths:
       - '.github/workflows/build.yml'
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Show Python & pip
         shell: bash
         run: |
-          
           python --version
           python -m pip --version
       - name: Install PyInstaller
         shell: bash
         run: |
-          
           python -m pip install --upgrade pip
           python -m pip install --upgrade pyinstaller
           python -m PyInstaller --version
+
       # Write build_json_gui.py via bash heredoc (adds Performance (continuous) support)
       - name: Write build_json_gui.py
         shell: bash
         run: |
-          
           cat > build_json_gui.py << 'PYCODE'
           # build_json_gui.py
           # JSON builder GUI for DistillerSR-like template
@@ -44,53 +46,68 @@ jobs:
           # - Remove any "child_forms": {} occurrences (pruned post-build)
           # - Remove all form-level "key" fields and any data items whose question text is "Key"
           # - user = "KimKwang" everywhere
+
           import json, csv, copy, tkinter as tk
           from tkinter import filedialog, messagebox, ttk
           from typing import Any, Dict, List, Tuple, Set
           from collections import defaultdict
+
           USER_NAME = "KimKwang"
+          # >>> Minimal change to enforce Radio/answer on Safety fields <<<
           SAFETY_RADIO_QUESTIONS = {"Device Failure Code", "Adverse Event", "Clinical Sign and Symptom Code"}
+
           def read_json(path: str):
               with open(path, "r", encoding="utf-8") as f:
                   return json.loads(f.read().strip())
+
           def write_json(path: str, data: Any):
               with open(path, "w", encoding="utf-8") as f:
                   json.dump(data, f, indent=4, ensure_ascii=False)
+
           def read_csv(path: str) -> List[Dict[str,str]]:
               rows: List[Dict[str,str]] = []
               with open(path, "r", encoding="utf-8-sig", newline="") as f:
                   for r in csv.DictReader(f):
                       rows.append({(k or "").strip(): (v or "").strip() for k, v in r.items()})
               return rows
+
           def deep_clone(obj: Any) -> Any:
               return json.loads(json.dumps(obj))
+
           def pad2(x: str) -> str:
               try:
                   return f"{int(str(x)) :02d}"
               except Exception:
                   return str(x)
+
           def join_key(parts: List[str]) -> str:
               return "\n".join([p for p in parts if p is not None and p != ""])
+
           class TemplateForms:
               def __init__(self, template_obj: Any):
                   if isinstance(template_obj, list): root = template_obj[0]
                   elif isinstance(template_obj, dict): root = template_obj
                   else: raise ValueError("Unexpected template format")
+
                   ds_dict = root.get("data_sets", {}) or {}
                   if not ds_dict: raise ValueError("Template does not contain data_sets")
                   first_ds_key = next(iter(ds_dict.keys()))
                   self.extraction_proto = deep_clone(ds_dict[first_ds_key])
+
                   self.spd_proto = None
                   self.safety_proto = None
                   self.perf_discrete_proto = None
                   self.perf_cont_proto = None
                   self.harms_proto = None
                   self.followup_proto = None
+
                   def is_followup(name: str) -> bool:
                       n = (name or "").strip()
                       return n == "Follow-up Subform" or n == "Follow up Subform"
+
                   def is_performance_cont(name: str) -> bool:
                       return (name or "").strip().lower() == "performance (continuous)"
+
                   for _, v in (self.extraction_proto.get("child_forms", {}) or {}).items():
                       name = (v.get("form") or "").strip()
                       if name == "Study Parameters and Demographics":
@@ -103,6 +120,7 @@ jobs:
                           self.perf_cont_proto = deep_clone(v)
                       elif is_followup(name):
                           self.followup_proto = deep_clone(v)
+
                   if self.spd_proto:
                       for _, v in (self.spd_proto.get("child_forms", {}) or {}).items():
                           nm = (v.get("form") or "").strip()
@@ -114,23 +132,28 @@ jobs:
                               self.perf_discrete_proto = deep_clone(v)
                           if is_performance_cont(nm) and self.perf_cont_proto is None:
                               self.perf_cont_proto = deep_clone(v)
+
                   if self.safety_proto:
                       for _, v in (self.safety_proto.get("child_forms", {}) or {}).items():
                           if (v.get("form") or "").strip() == "Harms":
                               self.harms_proto = deep_clone(v); break
+
               def question_types(self, form_proto: Dict[str, Any]) -> Dict[str, str]:
                   out: Dict[str, str] = {}
                   for q in form_proto.get("data", []) or []:
                       out[q.get("question","")] = q.get("type","Text")
                   return out
+
           class JSONBuilder:
               def __init__(self, tf: TemplateForms, logfn):
                   self.t = tf
                   self.log = logfn
                   self.next_id = 10000
+
               def _gen_id(self) -> str:
                   self.next_id += 1
                   return str(self.next_id)
+
               def _make_extraction(self, refid: str) -> Dict[str, Any]:
                   ds = deep_clone(self.t.extraction_proto)
                   ds["key"] = str(refid); ds["user"] = USER_NAME
@@ -139,25 +162,29 @@ jobs:
                           q.setdefault("response", {})["text"] = str(refid)
                   ds["child_forms"] = {}
                   return ds
+
               def _empty_from_proto(self, form_proto: Dict[str, Any]) -> Dict[str, Any]:
                   form = deep_clone(form_proto); form["user"] = USER_NAME
                   form["data"] = []
                   form.setdefault("child_forms", {})
                   return form
+
               def _populate_form_from_row(self, form_proto: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
                   form = deep_clone(form_proto); form["user"] = USER_NAME; form["data"] = []
                   qtypes = self.t.question_types(form_proto)
                   form_name = (form_proto.get("form") or "").strip()
                   for q_text, q_type in qtypes.items():
-                      # Force specific Safety questions to be Radio and captured in response.answer
+                      # >>> Minimal change: force Safety fields to Radio so value goes to response.answer
                       if form_name == "Safety" and q_text in SAFETY_RADIO_QUESTIONS:
                           q_type = "Radio"
+
                       if q_text not in row:
                           continue
                       raw = row[q_text]
                       val = (raw if raw is not None else "").strip()
                       if val == "":
                           continue
+
                       if q_text == "Associated CERs":
                           items = [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
                           for item in items:
@@ -178,6 +205,7 @@ jobs:
                               })
                   form.setdefault("child_forms", {})
                   return form
+
               def _generic_form_from_row(self, form_name: str, row: Dict[str, str], *, is_subform: int, level: int = 1) -> Dict[str, Any]:
                   frm = {"form": form_name, "level": level, "is_subform": is_subform,
                          "user": USER_NAME, "key": f"{form_name.lower().replace(' ','_')}_{self._gen_id()}",
@@ -191,6 +219,7 @@ jobs:
                       frm["data"].append({"question": col, "type": "Text",
                                           "response":{"answer":"", "text": val}})
                   return frm
+
               def _collect_all_pairs(self,
                                     spd_rows: List[Dict[str,str]],
                                     safety_rows: List[Dict[str,str]],
@@ -207,6 +236,7 @@ jobs:
                   for r in followup_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
                   for r in perf_cont_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
                   return pairs
+
               def _prune_child_forms(self, form: Dict[str, Any]) -> None:
                   cf = form.get("child_forms")
                   if isinstance(cf, dict):
@@ -214,6 +244,7 @@ jobs:
                           self._prune_child_forms(child)
                       if len(cf) == 0:
                           del form["child_forms"]
+
               def _strip_keys_everywhere(self, form: Dict[str, Any]) -> None:
                   if "key" in form:
                       del form["key"]
@@ -226,6 +257,7 @@ jobs:
                   if isinstance(cf, dict):
                       for _k, child in list(cf.items()):
                           self._strip_keys_everywhere(child)
+
               def build(self,
                         template_root: Dict[str, Any],
                         spd_rows: List[Dict[str, str]],
@@ -236,40 +268,51 @@ jobs:
                         perf_cont_rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
                   followup_rows = followup_rows or []
                   perf_cont_rows = perf_cont_rows or []
+
                   spd_rows_by_pair: Dict[Tuple[str,str], Dict[str,str]] = {}
                   for r in spd_rows:
                       key = ((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())
                       if key[0] and key[1]: spd_rows_by_pair[key] = r
+
                   safety_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
                   for r in safety_rows:
                       safety_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
+
                   harms_by_safety_id: Dict[str, List[Dict[str, str]]] = defaultdict(list)
                   for r in harms_rows:
                       sid = (r.get("safety_id") or "").strip()
                       if sid: harms_by_safety_id[sid].append(r)
+
                   perf_disc_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
                   for r in perf_disc_rows:
                       perf_disc_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
+
                   perf_cont_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
                   for r in perf_cont_rows:
                       perf_cont_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
+
                   followup_by_pair: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
                   for r in (followup_rows or []):
                       followup_by_pair[((r.get("refid") or "").strip(), (r.get("spd_id") or "").strip())].append(r)
+
                   pairs_by_refid = self._collect_all_pairs(spd_rows, safety_rows, perf_disc_rows, followup_rows, perf_cont_rows)
+
                   out: List[Dict[str, Any]] = []
                   for refid, spd_ids in pairs_by_refid.items():
                       refid_str = str(refid)
                       root = {"refid": int(refid) if str(refid).isdigit() else refid,
                               "tags": [], "attachments": [], "biblio_string": "", "data_sets": {}}
+
                       ds_id = self._gen_id()
                       extraction = self._make_extraction(refid_str)
                       extraction["child_forms"] = {}
+
                       self.log(f"REFID {refid}: building {len(spd_ids)} SP&D form(s)")
                       for spd_id in sorted(spd_ids, key=lambda x: (len(x), x)):
                           spd_disp = f"spd_{pad2(spd_id)}"
                           spd_key = join_key([refid_str, spd_disp])
                           pair = (refid, spd_id)
+
                           # SP&D
                           if self.t.spd_proto is None:
                               raise ValueError("Template missing Study Parameters and Demographics prototype.")
@@ -282,6 +325,7 @@ jobs:
                           spd_form["user"] = USER_NAME
                           spd_form["child_forms"] = {}
                           extraction["child_forms"][spd_key] = spd_form
+
                           # Follow up Subform FIRST
                           for fu_row in followup_by_pair.get(pair, []):
                               if self.t.followup_proto is not None:
@@ -293,6 +337,7 @@ jobs:
                                   fu_form = self._generic_form_from_row("Follow up Subform", fu_row, is_subform=1, level=1)
                               spd_form["child_forms"][fu_form["key"]] = fu_form
                               self.log(f" + Follow up Subform added for {pair}")
+
                           # Performance (continuous)
                           for pcrow in perf_cont_by_pair.get(pair, []):
                               epc = (pcrow.get("Perf Cont Endpoint") or "").strip()  # as in your example JSON
@@ -308,6 +353,7 @@ jobs:
                                   perfc_form["key"] = perfc_key
                               spd_form["child_forms"][perfc_key] = perfc_form
                               self.log(f" + Performance (continuous) added for {pair} -> {perfc_key}")
+
                           # Performance (discrete)
                           for prow in perf_disc_by_pair.get(pair, []):
                               endpoint = (prow.get("Perf Discrete Endpoint") or "").strip()
@@ -323,6 +369,7 @@ jobs:
                                   perf_form["key"] = perf_key
                               spd_form["child_forms"][perf_key] = perf_form
                               self.log(f" + Performance (discrete) added for {pair} -> {perf_key}")
+
                           # Safety + Harms
                           for srow in safety_by_pair.get(pair, []):
                               sid = (srow.get("safety_id") or "").strip()
@@ -338,6 +385,7 @@ jobs:
                               else:
                                   sform = self._generic_form_from_row("Safety", srow, is_subform=0, level=1)
                                   sform["key"] = safety_key
+
                               harms_added = 0
                               for hrow in harms_by_safety_id.get(sid, []):
                                   if self.t.harms_proto is not None:
@@ -349,16 +397,20 @@ jobs:
                                       hform = self._generic_form_from_row("Harms", hrow, is_subform=1, level=1)
                                   sform["child_forms"][hform["key"]] = hform
                                   harms_added += 1
+
                               spd_form["child_forms"][safety_key] = sform
                               self.log(f" + Safety added for {pair} -> {safety_key} (harms linked={harms_added})")
+
                       root["data_sets"][ds_id] = extraction
                       out.append(root)
+
                   # Prune empty child_forms, then strip "key" fields/questions
                   for dataset in out:
                       for _ds_key, form in (dataset.get("data_sets") or {}).items():
                           self._prune_child_forms(form)
                           self._strip_keys_everywhere(form)
                   return out
+
           class App(tk.Tk):
               def __init__(self):
                   super().__init__()
@@ -373,6 +425,7 @@ jobs:
                   self.followup_path = tk.StringVar()
                   self.out_path = tk.StringVar()
                   self._build_ui()
+
               def _row(self, r, label, var, filetypes):
                   tk.Label(self, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=6)
                   tk.Entry(self, textvariable=var, width=92).grid(row=r, column=1, padx=10)
@@ -380,11 +433,12 @@ jobs:
                       p = filedialog.askopenfilename(filetypes=filetypes)
                       if p: var.set(p)
                   tk.Button(self, text="Browse...", command=browse).grid(row=r, column=2, padx=8)
+
               def _build_ui(self):
                   self._row(0, "Template JSON:", self.template_path, [("JSON","*.json")])
                   ttk.Separator(self, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
                   self._row(2, "Study and Patient Demographics CSV (optional):", self.spd_path, [("CSV","*.csv")])
-                  self._row(3, "Follow up Subform CSV (optional):", self.followup_path, [("CSV","*.csv")])
+                  self._row(3, "Follow up Subform CSV (optional)::", self.followup_path, [("CSV","*.csv")])
                   self._row(4, "Safety CSV:", self.safety_path, [("CSV","*.csv")])
                   self._row(5, "Performance (discrete) CSV:", self.perf_disc_path, [("CSV","*.csv")])
                   self._row(6, "Performance (Continuous) CSV:", self.perf_cont_path, [("CSV","*.csv")])
@@ -399,12 +453,14 @@ jobs:
                   self.log.grid(row=10, column=0, columnspan=3, sticky="nsew", padx=10, pady=8)
                   self.grid_rowconfigure(10, weight=1); self.grid_columnconfigure(1, weight=1)
                   tk.Button(self, text="Build JSON", command=self.on_build).grid(row=11, column=2, sticky="e", padx=8, pady=10)
+
               def logmsg(self, msg: str):
                   try:
                       self.log.insert("end", str(msg)); self.log.insert("end", "\n")
                       self.log.see("end"); self.update_idletasks()
                   except Exception:
                       pass
+
               def on_build(self):
                   try:
                       if not self.template_path.get(): messagebox.showerror("Missing", "Please select the template JSON file."); return
@@ -413,9 +469,11 @@ jobs:
                       if not self.perf_cont_path.get(): messagebox.showerror("Missing", "Please select the Performance (Continuous) CSV file."); return
                       if not self.harms_path.get(): messagebox.showerror("Missing", "Please select the Harms CSV file."); return
                       if not self.out_path.get(): messagebox.showerror("Missing", "Please choose an output JSON path."); return
+
                       self.logmsg("Loading template...")
                       template_obj = read_json(self.template_path.get())
                       tf = TemplateForms(template_obj)
+
                       self.logmsg("Reading CSVs...")
                       spd_rows = read_csv(self.spd_path.get()) if self.spd_path.get() else []
                       safety_rows = read_csv(self.safety_path.get())
@@ -423,6 +481,7 @@ jobs:
                       perf_cont_rows = read_csv(self.perf_cont_path.get())
                       harms_rows = read_csv(self.harms_path.get())
                       followup_rows = read_csv(self.followup_path.get()) if self.followup_path.get() else []
+
                       # Validate IDs
                       def require(cols, rows, name):
                           if rows:
@@ -432,6 +491,7 @@ jobs:
                       require(("refid","spd_id"), perf_disc_rows, "Performance (discrete)")
                       require(("refid","spd_id"), perf_cont_rows, "Performance (Continuous)")
                       require(("safety_id",), harms_rows, "Harms")
+
                       self.logmsg("Building JSON...")
                       builder = JSONBuilder(tf, self.logmsg)
                       out_list = builder.build(
@@ -443,30 +503,51 @@ jobs:
                           followup_rows=followup_rows,
                           perf_cont_rows=perf_cont_rows
                       )
+
                       self.logmsg("Writing output...")
                       write_json(self.out_path.get(), out_list)
                       messagebox.showinfo("Success", "JSON built successfully and saved to:\n" + str(self.out_path.get()))
                   except Exception as e:
                       messagebox.showerror("Error", str(e)); self.logmsg(f"ERROR: {e}")
+
           if __name__ == "__main__":
               app = App()
               app.mainloop()
           PYCODE
+
       - name: Preflight syntax check
         shell: bash
         run: |
-          
           python -m py_compile build_json_gui.py
+
       - name: Build EXE (windowed, onefile)
         shell: bash
         run: |
-          
           python -m PyInstaller --clean --noconfirm --onefile --windowed build_json_gui.py
-          ls -la dist | true
-          test -f dist/build_json_gui.exe
+          ls -la dist || true
+
+      - name: Verify artifact exists
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'dist\build_json_gui.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Error "Executable not found at $exe"
+          } else {
+            Write-Host "Found: $exe"
+          }
+
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
           name: build_json_gui-exe
           path: dist/build_json_gui.exe
           if-no-files-found: error
+
+      # (Optional) Always upload PyInstaller warnings for troubleshooting
+      - name: Upload PyInstaller warnings (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyinstaller-warn-log
+          path: build/build_json_gui/warn-build_json_gui.txt
+          if-no-files-found: ignore
