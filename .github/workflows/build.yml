@@ -23,6 +23,7 @@ jobs:
         run: |
           python --version
           python -m pip --version
+
       - name: Install PyInstaller
         shell: bash
         run: |
@@ -30,7 +31,7 @@ jobs:
           python -m pip install --upgrade pyinstaller
           python -m PyInstaller --version
 
-      # Write build_json_gui.py via bash heredoc (adds Performance (continuous) support)
+      # Write build_json_gui.py via bash heredoc
       - name: Write build_json_gui.py
         shell: bash
         run: |
@@ -53,8 +54,16 @@ jobs:
           from collections import defaultdict
 
           USER_NAME = "KimKwang"
-          # >>> Minimal change to enforce Radio/answer on Safety fields <<<
-          SAFETY_RADIO_QUESTIONS = {"Device Failure Code", "Adverse Event", "Clinical Sign and Symptom Code"}
+
+          # --- SAFETY OVERRIDES (YOUR REQUEST) -----------------------------------
+          # These Safety questions must always be Radio and store value in response.answer
+          SAFETY_RADIO_QUESTIONS: Set[str] = {
+              "Device Failure Code",
+              "Adverse Event",
+              "Clinical Signs and Symptoms",      # canonical phrasing in your request
+              "Clinical Sign and Symptom Code",   # common variant in some templates
+          }
+          # ------------------------------------------------------------------------
 
           def read_json(path: str):
               with open(path, "r", encoding="utf-8") as f:
@@ -173,11 +182,8 @@ jobs:
                   form = deep_clone(form_proto); form["user"] = USER_NAME; form["data"] = []
                   qtypes = self.t.question_types(form_proto)
                   form_name = (form_proto.get("form") or "").strip()
-                  for q_text, q_type in qtypes.items():
-                      # >>> Minimal change: force Safety fields to Radio so value goes to response.answer
-                      if form_name == "Safety" and q_text in SAFETY_RADIO_QUESTIONS:
-                          q_type = "Radio"
 
+                  for q_text, q_type in qtypes.items():
                       if q_text not in row:
                           continue
                       raw = row[q_text]
@@ -185,6 +191,7 @@ jobs:
                       if val == "":
                           continue
 
+                      # Default behavior: Radio/Checkbox -> answer; others -> text
                       if q_text == "Associated CERs":
                           items = [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
                           for item in items:
@@ -203,8 +210,38 @@ jobs:
                                   "question": q_text, "type": q_type,
                                   "response": {"text": val, "answer": ""}
                               })
+
                   form.setdefault("child_forms", {})
                   return form
+
+              # --- NEW: Safety-only coercion to ensure Radio/answer exactly as requested ---
+              def _coerce_safety_fields(self, sform: Dict[str, Any]) -> None:
+                  """
+                  For Safety forms only: force type=Radio and move value to response.answer
+                  for the three specific questions (supports label variants).
+                  """
+                  if not isinstance(sform, dict):
+                      return
+                  if (sform.get("form") or "").strip() != "Safety":
+                      return
+                  data = sform.get("data")
+                  if not isinstance(data, list):
+                      return
+
+                  for item in data:
+                      q = (item.get("question") or "").strip()
+                      if q in SAFETY_RADIO_QUESTIONS:
+                          # Force type
+                          item["type"] = "Radio"
+                          resp = item.setdefault("response", {"text": "", "answer": ""})
+                          # Move any text value to answer
+                          text_val = (resp.get("text") or "").strip()
+                          ans_val = (resp.get("answer") or "").strip()
+                          if not ans_val and text_val:
+                              resp["answer"] = text_val
+                          # Ensure text is cleared
+                          resp["text"] = ""
+              # ---------------------------------------------------------------------------
 
               def _generic_form_from_row(self, form_name: str, row: Dict[str, str], *, is_subform: int, level: int = 1) -> Dict[str, Any]:
                   frm = {"form": form_name, "level": level, "is_subform": is_subform,
@@ -340,7 +377,7 @@ jobs:
 
                           # Performance (continuous)
                           for pcrow in perf_cont_by_pair.get(pair, []):
-                              epc = (pcrow.get("Perf Cont Endpoint") or "").strip()  # as in your example JSON
+                              epc = (pcrow.get("Perf Cont Endpoint") or "").strip()
                               epc_val = epc if epc != "" else None
                               perfc_key = join_key([refid_str, spd_disp, epc_val])
                               if self.t.perf_cont_proto is not None:
@@ -376,6 +413,7 @@ jobs:
                               adverse = (srow.get("Adverse Event") or "").strip()
                               adverse_val = adverse if adverse != "" else None
                               safety_key = join_key([refid_str, spd_disp, adverse_val])
+
                               if self.t.safety_proto is not None:
                                   sform = self._populate_form_from_row(self.t.safety_proto, srow)
                                   sform["form"] = "Safety"
@@ -385,6 +423,10 @@ jobs:
                               else:
                                   sform = self._generic_form_from_row("Safety", srow, is_subform=0, level=1)
                                   sform["key"] = safety_key
+
+                              # ---- APPLY YOUR REQUIRED SAFETY COERCION HERE ----
+                              self._coerce_safety_fields(sform)
+                              # ---------------------------------------------------
 
                               harms_added = 0
                               for hrow in harms_by_safety_id.get(sid, []):
@@ -438,7 +480,7 @@ jobs:
                   self._row(0, "Template JSON:", self.template_path, [("JSON","*.json")])
                   ttk.Separator(self, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
                   self._row(2, "Study and Patient Demographics CSV (optional):", self.spd_path, [("CSV","*.csv")])
-                  self._row(3, "Follow up Subform CSV (optional)::", self.followup_path, [("CSV","*.csv")])
+                  self._row(3, "Follow up Subform CSV (optional):", self.followup_path, [("CSV","*.csv")])
                   self._row(4, "Safety CSV:", self.safety_path, [("CSV","*.csv")])
                   self._row(5, "Performance (discrete) CSV:", self.perf_disc_path, [("CSV","*.csv")])
                   self._row(6, "Performance (Continuous) CSV:", self.perf_cont_path, [("CSV","*.csv")])
@@ -542,12 +584,3 @@ jobs:
           name: build_json_gui-exe
           path: dist/build_json_gui.exe
           if-no-files-found: error
-
-      # (Optional) Always upload PyInstaller warnings for troubleshooting
-      - name: Upload PyInstaller warnings (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pyinstaller-warn-log
-          path: build/build_json_gui/warn-build_json_gui.txt
-          if-no-files-found: ignore
