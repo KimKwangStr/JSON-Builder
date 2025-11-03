@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pyinstaller
           python -m PyInstaller --version
 
-      # Write build_json_gui.py via bash heredoc (ONLY the Python below changed to implement your key formats)
+      # Write build_json_gui.py via bash heredoc (UPDATED: remove empty Qs; Follow-up right after SP&D)
       - name: Write build_json_gui.py
         shell: bash
         run: |
@@ -42,12 +42,13 @@ jobs:
           # - SP&D under Extraction.child_forms keyed as "refid|spd_XX"
           # - Safety under SP&D; key "refid|spd_XX|<Adverse Event>"
           # - Performance (discrete) under SP&D; key "refid|spd_XX|<Perf Discrete Endpoint>"
-          # - Optional Follow-up Subform (unchanged)
+          # - Follow-up Subform added immediately after SP&D (ordering), and questions with no responses are removed.
           # - user = "KimKwang" everywhere
           import json, csv, copy, tkinter as tk
           from tkinter import filedialog, messagebox, ttk
           from typing import Any, Dict, List, Tuple, Set
           from collections import defaultdict
+
           USER_NAME = "KimKwang"
 
           def read_json(path: str):
@@ -147,46 +148,55 @@ jobs:
                   return ds
 
               def _empty_from_proto(self, form_proto: Dict[str, Any]) -> Dict[str, Any]:
+                  # No placeholders: leave data=[], preserve structure and child_forms
                   form = deep_clone(form_proto); form["user"] = USER_NAME
-                  form["data"] = [{"question": q.get("question",""),
-                                   "type": q.get("type","Text"),
-                                   "response":{"answer":"", "text":""}}
-                                  for q in (form_proto.get("data", []) or [])]
+                  form["data"] = []
                   form.setdefault("child_forms", {})
                   return form
 
               def _populate_form_from_row(self, form_proto: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
-                  form = deep_clone(form_proto); form["user"] = USER_NAME; form["data"]=[]
+                  # Build from prototype, but include ONLY answered questions
+                  form = deep_clone(form_proto); form["user"] = USER_NAME; form["data"] = []
                   qtypes = self.t.question_types(form_proto)
                   for q_text, q_type in qtypes.items():
-                      if q_text in row:
-                          val = row[q_text]
-                          if q_text == "Associated CERs":
-                              items = [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
-                              if not items:
-                                  form["data"].append({"question": q_text, "type": q_type,
-                                                       "response": {"text": "", "answer": ""}})
-                              else:
-                                  for item in items:
-                                      form["data"].append({"question": q_text, "type": q_type,
-                                                           "response": {"text": "", "answer": item}})
-                          else:
-                              resp = {"answer":"", "text":""}
-                              if q_type in ("Radio","Checkbox"): resp["answer"] = val
-                              else: resp["text"] = val
-                              form["data"].append({"question": q_text, "type": q_type, "response": resp})
+                      if q_text not in row:
+                          continue
+                      raw = row[q_text]
+                      val = (raw if raw is not None else "").strip()
+                      if val == "":
+                          continue
+                      if q_text == "Associated CERs":
+                          items = [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
+                          for item in items:
+                              form["data"].append({
+                                  "question": q_text, "type": q_type,
+                                  "response": {"text": "", "answer": item}
+                              })
                       else:
-                          form["data"].append({"question": q_text, "type": q_type,
-                                               "response":{"answer":"", "text":""}})
+                          if q_type in ("Radio", "Checkbox"):
+                              form["data"].append({
+                                  "question": q_text, "type": q_type,
+                                  "response": {"text": "", "answer": val}
+                              })
+                          else:
+                              form["data"].append({
+                                  "question": q_text, "type": q_type,
+                                  "response": {"text": val, "answer": ""}
+                              })
                   form.setdefault("child_forms", {})
                   return form
 
               def _generic_form_from_row(self, form_name: str, row: Dict[str, str], *, is_subform: int, level: int = 1) -> Dict[str, Any]:
+                  # Build a generic form including ONLY non-empty fields
                   frm = {"form": form_name, "level": level, "is_subform": is_subform,
                          "user": USER_NAME, "key": f"{form_name.lower().replace(' ','_')}_{self._gen_id()}",
                          "data": [], "child_forms": {}}
-                  for col, val in row.items():
-                      if col in ("refid","spd_id","safety_id"): continue
+                  for col, raw in row.items():
+                      if col in ("refid","spd_id","safety_id"):
+                          continue
+                      val = (raw if raw is not None else "").strip()
+                      if val == "":
+                          continue
                       frm["data"].append({"question": col, "type": "Text",
                                           "response":{"answer":"", "text": val}})
                   return frm
@@ -256,7 +266,7 @@ jobs:
                           spd_key = join_key([refid_str, spd_disp])                 # ==> refid|spd_XX
                           pair = (refid, spd_id)
 
-                          # SP&D form (from CSV if present, else empty-from-proto)
+                          # SP&D
                           if self.t.spd_proto is None:
                               raise ValueError("Template missing Study Parameters and Demographics prototype.")
                           if pair in spd_rows_by_pair:
@@ -270,9 +280,23 @@ jobs:
                           spd_form["child_forms"] = {}
                           extraction["child_forms"][spd_key] = spd_form
 
-                          # Performance (discrete) forms
+                          # === Follow-up Subform FIRST (directly follows SP&D) ===
+                          for fu_row in followup_by_pair.get(pair, []):
+                              if self.t.followup_proto is not None:
+                                  fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
+                                  fu_form["form"] = "Follow-up Subform"
+                                  fu_form["key"] = fu_form.get("key", f"followup_{self._gen_id()}")
+                                  fu_form["user"] = USER_NAME
+                              else:
+                                  fu_form = self._generic_form_from_row("Follow-up Subform", fu_row, is_subform=1, level=1)
+                              spd_form["child_forms"][fu_form["key"]] = fu_form
+                              self.log(f"    + Follow-up Subform added for {pair}")
+
+                          # Performance (discrete)
                           for prow in perf_by_pair.get(pair, []):
                               endpoint = (prow.get("Perf Discrete Endpoint") or "").strip()
+                              if endpoint == "":
+                                  endpoint = None
                               perf_key = join_key([refid_str, spd_disp, endpoint])   # ==> refid|spd_XX|<endpoint>
                               if self.t.perf_discrete_proto is not None:
                                   perf_form = self._populate_form_from_row(self.t.perf_discrete_proto, prow)
@@ -289,7 +313,8 @@ jobs:
                           for srow in safety_by_pair.get(pair, []):
                               sid = (srow.get("safety_id") or "").strip()
                               adverse = (srow.get("Adverse Event") or "").strip()
-                              safety_key = join_key([refid_str, spd_disp, adverse])  # ==> refid|spd_XX|<Adverse Event>
+                              adverse_val = adverse if adverse != "" else None
+                              safety_key = join_key([refid_str, spd_disp, adverse_val])  # ==> refid|spd_XX|<Adverse Event>
 
                               if self.t.safety_proto is not None:
                                   sform = self._populate_form_from_row(self.t.safety_proto, srow)
@@ -315,18 +340,6 @@ jobs:
 
                               spd_form["child_forms"][safety_key] = sform
                               self.log(f"    + Safety added for {pair} -> {safety_key} (harms linked={harms_added})")
-
-                          # Follow-up Subform (unchanged)
-                          for fu_row in followup_by_pair.get(pair, []):
-                              if self.t.followup_proto is not None:
-                                  fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
-                                  fu_form["form"] = "Follow-up Subform"
-                                  fu_form["key"] = fu_form.get("key", f"followup_{self._gen_id()}")
-                                  fu_form["user"] = USER_NAME
-                              else:
-                                  fu_form = self._generic_form_from_row("Follow-up Subform", fu_row, is_subform=1, level=1)
-                              spd_form["child_forms"][fu_form["key"]] = fu_form
-                              self.log(f"    + Follow-up Subform added for {pair}")
 
                       root["data_sets"][ds_id] = extraction
                       out.append(root)
@@ -411,7 +424,7 @@ jobs:
                       self.logmsg(f"Row counts → SPD:{len(spd_rows)} Safety:{len(safety_rows)} "
                                   f"Perf:{len(perf_rows)} Harms:{len(harms_rows)} Follow-up:{len(followup_rows)}")
 
-                      # Validate IDs
+                      # Validate IDs (unchanged)
                       def require(cols, rows, name):
                           if rows:
                               missing = [c for c in cols if c not in rows[0].keys()]
@@ -453,3 +466,4 @@ jobs:
           name: build_json_gui-exe
           path: dist/build_json_gui.exe
           if-no-files-found: error
+``
