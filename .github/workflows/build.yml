@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pyinstaller
           python -m PyInstaller --version
 
-      # Write build_json_gui.py via bash heredoc (UPDATED: "Follow up Subform" label)
+      # Write build_json_gui.py via bash heredoc (UPDATED: strip all "key" fields and any "Key" questions)
       - name: Write build_json_gui.py
         shell: bash
         run: |
@@ -45,11 +45,13 @@ jobs:
           # - Follow up Subform added immediately after SP&D (ordering)
           # - Remove questions without responses
           # - Remove any "child_forms": {} occurrences (pruned post-build)
+          # - NEW: Remove all "key" fields everywhere and any data items whose question is "Key"
           # - user = "KimKwang" everywhere
           import json, csv, copy, tkinter as tk
           from tkinter import filedialog, messagebox, ttk
           from typing import Any, Dict, List, Tuple, Set
           from collections import defaultdict
+
           USER_NAME = "KimKwang"
 
           def read_json(path: str):
@@ -97,7 +99,6 @@ jobs:
                   self.harms_proto = None
                   self.followup_proto = None
 
-                  # Accept both legacy "Follow-up Subform" and new "Follow up Subform" in prototypes
                   def is_followup(name: str) -> bool:
                       n = (name or "").strip()
                       return n == "Follow-up Subform" or n == "Follow up Subform"
@@ -231,6 +232,23 @@ jobs:
                       if len(cf) == 0:
                           del form["child_forms"]
 
+              # NEW: recursively remove "key" fields and any data items whose question is "Key"
+              def _strip_keys_everywhere(self, form: Dict[str, Any]) -> None:
+                  # Remove form-level "key"
+                  if "key" in form:
+                      del form["key"]
+                  # Remove any question rows named "Key" (case-insensitive)
+                  if isinstance(form.get("data"), list):
+                      form["data"] = [
+                          d for d in form["data"]
+                          if (d.get("question","").strip().lower() != "key")
+                      ]
+                  # Recurse into children
+                  cf = form.get("child_forms")
+                  if isinstance(cf, dict):
+                      for _k, child in list(cf.items()):
+                          self._strip_keys_everywhere(child)
+
               def build(self,
                         template_root: Dict[str, Any],
                         spd_rows: List[Dict[str, str]],
@@ -359,10 +377,11 @@ jobs:
                       root["data_sets"][ds_id] = extraction
                       out.append(root)
 
-                  # Prune empty child_forms everywhere
+                  # Prune empty child_forms, then strip "key" fields/questions everywhere
                   for dataset in out:
                       for _ds_key, form in (dataset.get("data_sets") or {}).items():
                           self._prune_child_forms(form)
+                          self._strip_keys_everywhere(form)
 
                   return out
 
