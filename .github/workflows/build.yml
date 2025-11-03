@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pyinstaller
           python -m PyInstaller --version
 
-      # Write build_json_gui.py via bash heredoc (UPDATED: remove empty Qs; Follow-up right after SP&D)
+      # Write build_json_gui.py via bash heredoc (UPDATED: "Follow up Subform" label)
       - name: Write build_json_gui.py
         shell: bash
         run: |
@@ -42,13 +42,14 @@ jobs:
           # - SP&D under Extraction.child_forms keyed as "refid|spd_XX"
           # - Safety under SP&D; key "refid|spd_XX|<Adverse Event>"
           # - Performance (discrete) under SP&D; key "refid|spd_XX|<Perf Discrete Endpoint>"
-          # - Follow-up Subform added immediately after SP&D (ordering), and questions with no responses are removed.
+          # - Follow up Subform added immediately after SP&D (ordering)
+          # - Remove questions without responses
+          # - Remove any "child_forms": {} occurrences (pruned post-build)
           # - user = "KimKwang" everywhere
           import json, csv, copy, tkinter as tk
           from tkinter import filedialog, messagebox, ttk
           from typing import Any, Dict, List, Tuple, Set
           from collections import defaultdict
-
           USER_NAME = "KimKwang"
 
           def read_json(path: str):
@@ -96,6 +97,11 @@ jobs:
                   self.harms_proto = None
                   self.followup_proto = None
 
+                  # Accept both legacy "Follow-up Subform" and new "Follow up Subform" in prototypes
+                  def is_followup(name: str) -> bool:
+                      n = (name or "").strip()
+                      return n == "Follow-up Subform" or n == "Follow up Subform"
+
                   for _, v in (self.extraction_proto.get("child_forms", {}) or {}).items():
                       name = (v.get("form") or "").strip()
                       if name == "Study Parameters and Demographics":
@@ -104,13 +110,13 @@ jobs:
                           self.safety_proto = deep_clone(v)
                       elif name == "Performance (discrete)":
                           self.perf_discrete_proto = deep_clone(v)
-                      elif name == "Follow-up Subform":
+                      elif is_followup(name):
                           self.followup_proto = deep_clone(v)
 
                   if self.spd_proto:
                       for _, v in (self.spd_proto.get("child_forms", {}) or {}).items():
                           nm = (v.get("form") or "").strip()
-                          if nm == "Follow-up Subform" and self.followup_proto is None:
+                          if is_followup(nm) and self.followup_proto is None:
                               self.followup_proto = deep_clone(v)
                           if nm == "Safety" and self.safety_proto is None:
                               self.safety_proto = deep_clone(v)
@@ -216,6 +222,15 @@ jobs:
                   for r in followup_rows: add(r.get("refid","").strip(), r.get("spd_id","").strip())
                   return pairs
 
+              # Recursively prune empty child_forms dicts
+              def _prune_child_forms(self, form: Dict[str, Any]) -> None:
+                  cf = form.get("child_forms")
+                  if isinstance(cf, dict):
+                      for _k, child in list(cf.items()):
+                          self._prune_child_forms(child)
+                      if len(cf) == 0:
+                          del form["child_forms"]
+
               def build(self,
                         template_root: Dict[str, Any],
                         spd_rows: List[Dict[str, str]],
@@ -280,17 +295,17 @@ jobs:
                           spd_form["child_forms"] = {}
                           extraction["child_forms"][spd_key] = spd_form
 
-                          # === Follow-up Subform FIRST (directly follows SP&D) ===
+                          # === Follow up Subform FIRST (directly follows SP&D) ===
                           for fu_row in followup_by_pair.get(pair, []):
                               if self.t.followup_proto is not None:
                                   fu_form = self._populate_form_from_row(self.t.followup_proto, fu_row)
-                                  fu_form["form"] = "Follow-up Subform"
+                                  fu_form["form"] = "Follow up Subform"
                                   fu_form["key"] = fu_form.get("key", f"followup_{self._gen_id()}")
                                   fu_form["user"] = USER_NAME
                               else:
-                                  fu_form = self._generic_form_from_row("Follow-up Subform", fu_row, is_subform=1, level=1)
+                                  fu_form = self._generic_form_from_row("Follow up Subform", fu_row, is_subform=1, level=1)
                               spd_form["child_forms"][fu_form["key"]] = fu_form
-                              self.log(f"    + Follow-up Subform added for {pair}")
+                              self.log(f"    + Follow up Subform added for {pair}")
 
                           # Performance (discrete)
                           for prow in perf_by_pair.get(pair, []):
@@ -344,6 +359,11 @@ jobs:
                       root["data_sets"][ds_id] = extraction
                       out.append(root)
 
+                  # Prune empty child_forms everywhere
+                  for dataset in out:
+                      for _ds_key, form in (dataset.get("data_sets") or {}).items():
+                          self._prune_child_forms(form)
+
                   return out
 
           class App(tk.Tk):
@@ -374,7 +394,7 @@ jobs:
                   self._row(0, "Template JSON:", self.template_path, [("JSON","*.json")])
                   ttk.Separator(self, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
                   self._row(2, "Study and Patient Demographics CSV (optional):", self.spd_path, [("CSV","*.csv")])
-                  self._row(3, "Follow-up Subform CSV (optional):", self.followup_path, [("CSV","*.csv")])
+                  self._row(3, "Follow up Subform CSV (optional):", self.followup_path, [("CSV","*.csv")])
                   self._row(4, "Safety CSV:", self.safety_path, [("CSV","*.csv")])
                   self._row(5, "Performance (discrete) CSV:", self.perf_path, [("CSV","*.csv")])
                   self._row(6, "Harms CSV:", self.harms_path, [("CSV","*.csv")])
@@ -422,7 +442,7 @@ jobs:
                       harms_rows = read_csv(self.harms_path.get())
                       followup_rows = read_csv(self.followup_path.get()) if self.followup_path.get() else []
                       self.logmsg(f"Row counts → SPD:{len(spd_rows)} Safety:{len(safety_rows)} "
-                                  f"Perf:{len(perf_rows)} Harms:{len(harms_rows)} Follow-up:{len(followup_rows)}")
+                                  f"Perf:{len(perf_rows)} Harms:{len(harms_rows)} Follow up:{len(followup_rows)}")
 
                       # Validate IDs (unchanged)
                       def require(cols, rows, name):
