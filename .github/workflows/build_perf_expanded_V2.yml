@@ -40,23 +40,23 @@ jobs:
           #
           # Hierarchy produced:
           #   Extraction
-          #     └── Study Parameters and Demographics            (refid + SPD_id)   [REQUIRED CSV]
-          #           ├── Follow up Subform                      (refid + SPD_id)
-          #           ├── Device                                 (refid + SPD_id)
-          #           ├── Safety                                 (refid + SPD_id)
-          #           │     └── Harms                            (Safety_id)
-          #           ├── Performance (continuous)               (refid + SPD_id)
-          #           ├── Performance (discrete)                 (refid + SPD_id)
-          #           ├── Changes - Arthroplasty                 (refid + Change_id [+ SPD_id])
-          #           │     ├── Subform - Changes                (refid + Change_id)
-          #           │     ├── Subform - Author Delta - Changes (refid + Change_id)
-          #           │     └── Subform - User Delta - Changes   (refid + Change_id)
-          #           ├── Indication - Arthroplasty              (refid + SPD_id)
-          #           ├── Procedure - Arthroplasty               (refid + SPD_id)
-          #           ├── Configuration - Arthroplasty           (refid + SPD_id)
-          #           ├── Fixation Method - Arthroplasty         (refid + SPD_id)
-          #           ├── Additional Stratification - Arthroplasty (refid + SPD_id)
-          #           └── OCY - Arthroplasty                     (refid + SPD_id)
+          #     +-- Study Parameters and Demographics            (Refid + SPD_id)   [REQUIRED CSV]
+          #           +-- Follow up Subform                      (Refid + SPD_id)
+          #           +-- Device                                 (Refid + SPD_id)
+          #           +-- Safety                                 (Refid + SPD_id)
+          #           |     +-- Harms                            (Safety_id)
+          #           +-- Performance (continuous)               (Refid + SPD_id)
+          #           +-- Performance (discrete)                 (Refid + SPD_id)
+          #           +-- Changes - Arthroplasty                 (Refid + Change_id [+ SPD_id])
+          #           |     +-- Subform - Changes                (Refid + Change_id)
+          #           |     +-- Subform - Author Delta - Changes (Refid + Change_id)
+          #           |     +-- Subform - User Delta - Changes   (Refid + Change_id)
+          #           +-- Indication - Arthroplasty              (Refid + SPD_id)
+          #           +-- Procedure - Arthroplasty               (Refid + SPD_id)
+          #           +-- Configuration - Arthroplasty           (Refid + SPD_id)
+          #           +-- Fixation Method - Arthroplasty         (Refid + SPD_id)
+          #           +-- Additional Stratification - Arthroplasty (Refid + SPD_id)
+          #           +-- OCY - Arthroplasty                     (Refid + SPD_id)
           #
           # Notes:
           # - Only the Study Parameters and Demographics CSV is mandatory; every other CSV is optional.
@@ -562,12 +562,15 @@ jobs:
               (F_OCY, "OCY - Arthroplasty CSV"),
           ]
 
+          LOG_HEIGHT = 6  # monitor window height in text rows (half of the previous 12)
+
 
           class App(tk.Tk):
               def __init__(self):
                   super().__init__()
                   self.title("JSON Builder from CSVs")
-                  self.geometry("1040x760")
+                  self.geometry("1040x720")
+                  self.minsize(880, 520)
                   self.template_path = tk.StringVar()
                   self.out_path = tk.StringVar()
                   self.csv_vars: Dict[str, tk.StringVar] = {name: tk.StringVar() for name, _ in CSV_INPUTS}
@@ -575,7 +578,7 @@ jobs:
 
               def _file_row(self, parent, r, label, var, filetypes):
                   tk.Label(parent, text=label, anchor="w").grid(row=r, column=0, sticky="w", padx=10, pady=3)
-                  tk.Entry(parent, textvariable=var, width=78).grid(row=r, column=1, padx=10, sticky="ew")
+                  tk.Entry(parent, textvariable=var).grid(row=r, column=1, padx=10, sticky="ew")
 
                   def browse():
                       p = filedialog.askopenfilename(filetypes=filetypes)
@@ -587,19 +590,46 @@ jobs:
                   parent.grid_columnconfigure(1, weight=1)
 
               def _build_ui(self):
+                  # --- top: template picker ---
                   top = tk.Frame(self)
-                  top.pack(fill="x")
+                  top.pack(side="top", fill="x")
                   self._file_row(top, 0, "Template JSON (required):", self.template_path, [("JSON", "*.json")])
-                  ttk.Separator(self, orient="horizontal").pack(fill="x", padx=10, pady=4)
+                  ttk.Separator(self, orient="horizontal").pack(side="top", fill="x", padx=10, pady=4)
 
+                  # --- bottom bar packed FIRST from the bottom so the action button is always visible ---
+                  action = tk.Frame(self)
+                  action.pack(side="bottom", fill="x", padx=12, pady=(4, 10))
+                  tk.Button(action, text="Build JSON", command=self.on_build,
+                            width=18, height=2).pack(side="right")
+                  tk.Button(action, text="Clear All CSVs", command=self._clear_all,
+                            width=16).pack(side="right", padx=(0, 8))
+
+                  log_frame = tk.Frame(self)
+                  log_frame.pack(side="bottom", fill="x", padx=10, pady=(4, 0))
+                  tk.Label(log_frame, text="Build log:", anchor="w").pack(fill="x")
+                  log_inner = tk.Frame(log_frame)
+                  log_inner.pack(fill="x")
+                  self.log = tk.Text(log_inner, height=LOG_HEIGHT, wrap="none")
+                  log_sb = ttk.Scrollbar(log_inner, orient="vertical", command=self.log.yview)
+                  self.log.configure(yscrollcommand=log_sb.set)
+                  self.log.pack(side="left", fill="both", expand=True)
+                  log_sb.pack(side="right", fill="y")
+
+                  out_frame = tk.Frame(self)
+                  out_frame.pack(side="bottom", fill="x")
+                  self._file_row(out_frame, 0, "Output JSON:", self.out_path, [("JSON", "*.json")])
+                  tk.Button(out_frame, text="Save As...", command=self._choose_out).grid(row=0, column=2, padx=4)
+
+                  ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x", padx=10, pady=4)
+
+                  # --- middle: scrollable CSV list, takes whatever space is left ---
                   tk.Label(self, text="CSV inputs - only Study Parameters and Demographics is required; "
                                       "leave any other row blank to skip that form.",
-                           anchor="w", fg="#444").pack(fill="x", padx=10)
+                           anchor="w", fg="#444").pack(side="top", fill="x", padx=10)
 
-                  # scrollable CSV area
                   container = tk.Frame(self)
-                  container.pack(fill="both", expand=True, padx=4, pady=4)
-                  canvas = tk.Canvas(container, height=330, highlightthickness=0)
+                  container.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+                  canvas = tk.Canvas(container, highlightthickness=0)
                   vsb = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
                   inner = tk.Frame(canvas)
                   inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -613,15 +643,9 @@ jobs:
                   for i, (name, label) in enumerate(CSV_INPUTS):
                       self._file_row(inner, i, label + ":", self.csv_vars[name], [("CSV", "*.csv")])
 
-                  ttk.Separator(self, orient="horizontal").pack(fill="x", padx=10, pady=4)
-                  bottom = tk.Frame(self)
-                  bottom.pack(fill="x")
-                  self._file_row(bottom, 0, "Output JSON:", self.out_path, [("JSON", "*.json")])
-                  tk.Button(bottom, text="Save As...", command=self._choose_out).grid(row=0, column=2, padx=4)
-
-                  self.log = tk.Text(self, height=12)
-                  self.log.pack(fill="both", expand=True, padx=10, pady=6)
-                  tk.Button(self, text="Build JSON", command=self.on_build, width=18).pack(anchor="e", padx=12, pady=(0, 10))
+              def _clear_all(self):
+                  for v in self.csv_vars.values():
+                      v.set("")
 
               def _choose_out(self):
                   p = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
